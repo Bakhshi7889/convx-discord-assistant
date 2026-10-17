@@ -1,0 +1,10 @@
+# Copy this file to .dev.vars for local Wrangler tests.
+# Never put real keys in GitHub.
+DISCORD_TOKEN=
+POLLINATIONS_API_KEY=
+TARGET_CHANNEL_ID=
+BOT_USER_ID=
+GUILD_ID=
+ADMIN_ROLE_IDS=
+ADMIN_USER_IDS=
+MANUAL_RUN_KEY=
