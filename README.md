@@ -56,3 +56,13 @@ node --check worker.js
 ```
 
 The implementation has not been end-to-end tested using your live Discord and Pollinations credentials. Test it in a private Discord channel before relying on it for onboarding.
+
+
+## GitHub Actions
+
+Every push to main runs a Worker syntax/configuration check. The workflow's deployment job is manual so it doesn't fail before deployment credentials are configured. To enable it, open **Repository → Settings → Secrets and variables → Actions** and add:
+
+- `CLOUDFLARE_API_TOKEN`: a Cloudflare API token with permission to edit Workers Scripts and access the existing D1 binding.
+- `CLOUDFLARE_ACCOUNT_ID`: the Cloudflare account ID.
+
+Then open **Actions → Validate and deploy Convx Assistant → Run workflow**. The Worker is already deployed directly from the connected Cloudflare account; these GitHub secrets are only for later GitHub-triggered deployments. Do not add Discord or Pollinations keys to GitHub.
