@@ -38,10 +38,10 @@ async function discord(env, path, options = {}) {
   if (response.status === 204) return null;
   return response.json();
 }
-async function saveMessage(db, m) {
+async function saveMessage(env, db, m) {
   if (!m?.id || !m?.channel_id || !m?.author?.id || !m.content) return;
   const name = m.member?.nick || m.author.global_name || m.author.username || "Discord user";
-  const url = "https://discord.com/channels/" + (m.guild_id || "@me") + "/" + m.channel_id + "/" + m.id;
+  const url = "https://discord.com/channels/" + (env.GUILD_ID || m.guild_id || "@me") + "/" + m.channel_id + "/" + m.id;
   await db.prepare(
     "INSERT INTO messages(message_id,channel_id,author_id,author_name,content,created_at,message_url) " +
     "VALUES(?,?,?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET " +
@@ -201,14 +201,12 @@ async function models(db, force = false) {
     const cached = await db.prepare(
       "SELECT model_id,health,success_rate,request_count FROM models WHERE eligible=1"
     ).all();
-    if (cached.results?.length) {
-      return cached.results.sort((a, b) =>
-        statusRank(a.health) - statusRank(b.health) ||
-        (b.success_rate ?? -1) - (a.success_rate ?? -1) ||
-        b.request_count - a.request_count ||
-        a.model_id.localeCompare(b.model_id)
-      );
-    }
+    return (cached.results || []).sort((a, b) =>
+      statusRank(a.health) - statusRank(b.health) ||
+      (b.success_rate ?? -1) - (a.success_rate ?? -1) ||
+      b.request_count - a.request_count ||
+      a.model_id.localeCompare(b.model_id)
+    );
   }
   const response = await fetch(POLLINATIONS_API + "/text/models?source=community&reliability=all", {
     headers: { "accept": "application/json" },
@@ -427,7 +425,7 @@ async function backfillHistory(env) {
       await setSetting(db, "history_sync_before", "");
       return;
     }
-    for (const message of batch) await saveMessage(db, message);
+    for (const message of batch) await saveMessage(env, db, message);
     before = batch[batch.length - 1].id;
     await setSetting(db, "history_sync_before", before);
     if (batch.length < 100) {
@@ -445,7 +443,7 @@ async function pollNewMessages(env) {
     const recent = await fetchChannelMessages(env, {});
     if (!recent.length) return;
     const sorted = [...recent].sort(compareSnowflakes);
-    for (const message of sorted) await saveMessage(db, message);
+    for (const message of sorted) await saveMessage(env, db, message);
     cursor = sorted[sorted.length - 1].id;
     await setSetting(db, "last_message_id", cursor);
     if (!(await setting(db, "history_sync_state"))) await startHistorySync(db);
@@ -455,7 +453,7 @@ async function pollNewMessages(env) {
       if (!Array.isArray(batch) || batch.length === 0) break;
       const sorted = [...batch].sort(compareSnowflakes);
       for (const message of sorted) {
-        await saveMessage(db, message);
+        await saveMessage(env, db, message);
         await handleMention(env, message);
         cursor = message.id;
         await setSetting(db, "last_message_id", cursor);
