@@ -1,0 +1,14 @@
+name = "convx-discord-assistant"
+main = "worker.js"
+compatibility_date = "2026-10-18"
+
+[observability]
+enabled = true
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "convx-discord-assistant"
+database_id = "9da42b8b-4129-40bf-b19a-d76acb7ee801"
