@@ -208,7 +208,7 @@ async function models(db, force = false) {
       a.model_id.localeCompare(b.model_id)
     );
   }
-  const response = await fetch(POLLINATIONS_API + "/text/models?source=community&reliability=all", {
+  const response = await fetch(POLLINATIONS_API + "/text/models?community=true&reliability=all", {
     headers: { "accept": "application/json" },
     signal: AbortSignal.timeout(10000)
   });
