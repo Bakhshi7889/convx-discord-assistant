@@ -401,12 +401,12 @@ async function handleMention(env, message) {
   }
 }
 async function fetchChannelMessages(env, params) {
-  const url = new URL(DISCORD_API + "/channels/" + env.TARGET_CHANNEL_ID + "/messages");
-  url.searchParams.set("limit", "100");
+  const query = new URLSearchParams({ limit: "100" });
   for (const [key, value] of Object.entries(params || {})) {
-    if (value) url.searchParams.set(key, value);
+    if (value) query.set(key, value);
   }
-  return discord(env, url.pathname + url.search);
+  // discord() already prefixes /api/v10, so pass only the relative API path here.
+  return discord(env, "/channels/" + env.TARGET_CHANNEL_ID + "/messages?" + query.toString());
 }
 async function backfillHistory(env) {
   const db = env.DB;
