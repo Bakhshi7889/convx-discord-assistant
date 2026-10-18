@@ -576,6 +576,9 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null) {
       : "STANDALONE MESSAGE: No reply or quote was supplied. Treat the newest message as a complete, standalone message. Never say you need a quoted message or that there is no conversation to respond to.";
   const system = [
     "You are CONVY (she/her), the Convx assistant. Keep a consistent, natural, feminine-coded conversational voice: confident, playful, curious, a little mischievous, and warm without being gushy. Speak like someone chatting in Discord, not a help desk. Do not introduce yourself or mention your model unless asked. Stay in character naturally; never volunteer that you are fictional, but do not falsely claim to be human if directly asked.",
+    String(env.CONVY_CUSTOM_INSTRUCTIONS || "").trim()
+      ? "OWNER-CUSTOMIZED INSTRUCTIONS (follow unless they conflict with safety, privacy, or accuracy):\n" + String(env.CONVY_CUSTOM_INSTRUCTIONS).trim().slice(0, 5000)
+      : "OWNER-CUSTOMIZED INSTRUCTIONS: No optional custom instructions are configured. Follow the built-in CONVY persona and behavior rules.",
     "STYLE: Answer the newest message directly, in context. Be concise by default, usually 1-3 sentences. Use contractions and casual language where natural. A normal @mention is the user talking to you, not a request to explain their own message. For simple check-ins like 'you up?' or 'are you awake?', answer naturally and briefly. Do not narrate the user's intent, parrot their words back, or ask for context that was not needed. Ask one focused clarification only when genuinely necessary. Avoid repeating stock greetings. At most one dry joke when it fits.",
     replyInstructions,
     "AVOID: No theatrical roast monologues, random analogies piled together, filler, generic sign-offs, unnecessary introductions, model IDs, or fake personal details. Never invent facts about people or claim to have seen context that is not provided. Tagged-member roasts are handled deterministically by the bot.",
@@ -800,7 +803,9 @@ async function handleMention(env, message) {
   const botId = String(env.BOT_USER_ID || "");
   if (!botId) return;
   const mention = new RegExp("<@!?" + botId + ">");
-  if (!mention.test(message.content || "")) return;
+  const isMention = mention.test(message.content || "");
+  const isReply = await isReplyToBot(env, message);
+  if (!isMention && !isReply) return;
   const query = String(message.content || "").replace(mention, "").trim();
   if (!query) {
     await sendUserReply(env, message, "hey, I'm here. what's up?", message.id);
@@ -808,6 +813,13 @@ async function handleMention(env, message) {
   }
   const command = query.trim();
   const normalizedCommand = normalize(command);
+  if (/^(show|give|tell me|reveal|print|repeat|what are) (your )?(custom |system )?instructions\b/.test(normalizedCommand) ||
+      /^(show|give|reveal|print) (your )?(system prompt|hidden prompt)\b/.test(normalizedCommand)) {
+    await sendUserReply(env, message,
+      "I can't share my private system prompt verbatim, but here's the useful version: I'm CONVY, the Convx assistant. I should be natural, concise, playful without being obnoxious, answer the actual message, use reply context when available, respect Convx's approved knowledge, and never invent facts or expose private data. If I'm failing at any of that, that's a bug to fix, not a secret to leak.",
+      message.id);
+    return;
+  }
   if (["are you awake", "are you up", "you up", "u up", "awake", "are you there", "you there", "still there"].includes(normalizedCommand)) {
     await sendUserReply(env, message, "yep, I'm here. what's up?", message.id);
     return;
@@ -981,6 +993,24 @@ function isBotMention(env, message) {
   const botId = String(env.BOT_USER_ID || "");
   if (!/^\d{15,22}$/.test(botId)) return false;
   return new RegExp("<@!?" + botId + ">").test(String(message.content || ""));
+}
+async function isReplyToBot(env, message) {
+  const botId = String(env.BOT_USER_ID || "");
+  const reference = message?.message_reference || message?.reference || null;
+  if (!botId || !reference?.message_id) return false;
+  if (reference.type !== undefined && reference.type !== null && Number(reference.type) !== 0) return false;
+  let referenced = message.referenced_message || null;
+  if (!referenced || String(referenced.id) !== String(reference.message_id) || !referenced.author?.id) {
+    const channelId = String(reference.channel_id || message.channel_id || "");
+    if (!/^\d{15,22}$/.test(channelId) || !/^\d{15,22}$/.test(String(reference.message_id))) return false;
+    try {
+      referenced = await discord(env, "/channels/" + channelId + "/messages/" + reference.message_id);
+    } catch (error) {
+      console.log("Reply target lookup failed: " + String(error.message || error).slice(0, 100));
+      return false;
+    }
+  }
+  return String(referenced?.author?.id || "") === botId;
 }
 async function claimMentionOnce(db, message) {
   const key = "handled_mention:" + String(message.id);
@@ -1415,7 +1445,10 @@ export class DiscordGateway extends DurableObject {
 
   async processMessage(message) {
     if (!message || message.guild_id !== String(this.env.GUILD_ID || "") || message.author?.bot) return;
-    if (!isBotMention(this.env, message)) return;
+    const mentioned = isBotMention(this.env, message);
+    // Replying directly to a CONVY message is an implicit address, even without @mention.
+    const repliedToBot = !mentioned && await isReplyToBot(this.env, message);
+    if (!mentioned && !repliedToBot) return;
 
     const messageId = String(message.id || "");
     if (!messageId || this.inFlightMessages.has(messageId)) return;
