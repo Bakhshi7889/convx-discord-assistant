@@ -394,6 +394,17 @@ async function addKnowledge(env, message, args) {
   ).bind(parts[0], parts[1], parts.slice(2).join("|"), message.author.id).run();
   return "Saved approved answer #" + result.meta.last_row_id + ". I'll check it for future related questions.";
 }
+function resolveUserMentions(query, message) {
+  const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+  return String(query || "").replace(/<@!?(\\d+)>/g, (raw, id) => {
+    const user = mentions.find(candidate => String(candidate.id) === String(id));
+    const name = String(user?.global_name || user?.username || "")
+      .replace(/[<>\\r\\n@]/g, "")
+      .trim()
+      .slice(0, 64);
+    return name ? "@" + name : "the mentioned member";
+  });
+}
 async function handleMention(env, message) {
   if (message.author?.bot) return;
   const botId = String(env.BOT_USER_ID || "");
@@ -408,7 +419,7 @@ async function handleMention(env, message) {
   const command = query.trim();
   if (command === "!help") {
     await sendReply(env, message.channel_id,
-      "I'm CONVY (she/her), Convx's sarcastic resident AI. I answer questions, use the approved server notes, remember useful conversations when admins ask, and occasionally roast the logic that brought us here.\n\nMention me with a question.\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
+      "I'm CONVY (she/her), Convx's sarcastic resident AI. I answer questions, use the approved server notes, remember useful conversations when admins ask, and occasionally roast the logic that brought us here.\n\nMention me with a question. Ask me to \"roast @member\" for playful teasing; I'll roast the choices, not someone's identity.\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
     return;
   }
   if (isSaveRequest(command)) {
@@ -501,7 +512,7 @@ async function handleMention(env, message) {
     return;
   }
   try {
-    const answer = await generateAnswer(env, env.DB, query, message.channel_id);
+    const answer = await generateAnswer(env, env.DB, resolveUserMentions(query, message), message.channel_id);
     await sendReply(env, message.channel_id, answer, message.id);
   } catch (error) {
     const alert = await claimAdminAlert(env, env.DB, "answer-failure");
