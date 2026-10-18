@@ -9,7 +9,9 @@ const OPENROUTER_MODEL_CHECK_CACHE_MS = 15 * 60 * 1000;
 const OPENROUTER_REQUEST_TIMEOUT_MS = 12000;
 // Lazy-refresh the shared Pollinations catalog hourly in Durable Object storage, never D1.
 const MODEL_CACHE_MS = 60 * 60 * 1000;
-const MODEL_CATALOG_SCHEMA_VERSION = 5;
+// A previously verified zero-price catalog can be used briefly during a catalog outage.
+const MODEL_STALE_FALLBACK_MAX_MS = 24 * 60 * 60 * 1000;
+const MODEL_CATALOG_SCHEMA_VERSION = 6;
 const MODEL_ATTEMPT_LIMIT = 3;
 const MODEL_TIMEOUT_MS = 9000;
 // Explicit first-choice order. Models still must appear in the live catalog as eligible,
@@ -33,10 +35,10 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r24";
+const CONVY_BUILD_VERSION = "convx-2026-10-19-r25";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Refine the verified-adult content-mode instruction so it preserves CONVY's existing independent personality and conversational style instead of switching her into a dedicated roleplay bot.",
-  "Only adapt the tone when an appropriately verified adult explicitly requests mature content; preserve ordinary chat, memory, commands, and provider routing."
+  "Keep CONVY's established independent persona and ordinary conversation behavior.",
+  "Improve provider diagnostics and allow a recent, previously verified zero-price Pollinations catalog snapshot during brief catalog outages."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -1077,8 +1079,9 @@ function withRuntimeSnapshot(env, messages, modelId, settings, hasImages, tuning
 async function callPollinationsModel(env,db,messages,maxTokens=550) {
   if (!env.POLLINATIONS_API_KEY) throw new Error("Pollinations API key is not configured yet.");
   const catalog = await models(env);
-  if (catalog.stale) {
-    throw new Error("The live Pollinations free-model catalog could not be verified. No model request was sent because the cached pricing/eligibility data is stale.");
+  const staleAge = Date.now() - Number(catalog.checkedAt || 0);
+  if (catalog.stale && (staleAge < 0 || staleAge > MODEL_STALE_FALLBACK_MAX_MS)) {
+    throw new Error("The live Pollinations catalog is unavailable and its last verified zero-price snapshot is older than 24 hours. No model request was sent.");
   }
   const pool = catalog.models;
   if (!pool.length) {
@@ -2495,6 +2498,37 @@ async function handleMention(env, message) {
     await setSetting(env.DB, "owner_selected_model_id", requestedId);
     await sendUserReply(env, message,
       "Model override set to '" + requestedId + "'. I'll prefer it for text replies. Image requests will use it only if it's one of the two vision-capable models; otherwise I'll route those to the vision models. Use !model auto to reset.",
+      message.id);
+    return;
+  }
+  if (command === "!provider") {
+    if (!(await isAdmin(env, message))) {
+      await sendUserReply(env, message, "Nope. !provider is admin-only.", message.id);
+      return;
+    }
+    const provider = configuredPrimaryProvider(env);
+    const modelId = configuredOpenRouterModel(env);
+    const hasKey = Boolean(env.OPENROUTER_API_KEY);
+    const selected = await setting(env.DB, "owner_selected_model_id");
+    let statusText = "not checked in this command";
+    try {
+      const status = await gatewayControl(env, "/providers/openrouter/model-status?model=" + encodeURIComponent(modelId));
+      const cached = status?.status;
+      if (cached && cached.modelId === modelId) {
+        statusText = cached.verified === true
+          ? "verified free at " + new Date(Number(cached.checkedAt)).toISOString()
+          : "last check failed: " + String(cached.reason || "unknown reason").slice(0, 150);
+      }
+    } catch {}
+    await sendUserReply(env, message,
+      "**Provider diagnostics**\\n" +
+      "Build: " + CONVY_BUILD_VERSION + "\\n" +
+      "Primary provider env: " + provider + "\\n" +
+      "Configured OpenRouter model: " + modelId + "\\n" +
+      "OpenRouter key present: " + (hasKey ? "yes (value hidden)" : "NO") + "\\n" +
+      "Cached free-price verification: " + statusText + "\\n" +
+      "Manual model override: " + (selected || "none, automatic primary routing") + "\\n" +
+      "Routing note: explicit model overrides use Pollinations; image requests currently use Pollinations vision models. Check Worker logs for the exact provider/model event.",
       message.id);
     return;
   }
