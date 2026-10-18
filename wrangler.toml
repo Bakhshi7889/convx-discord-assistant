@@ -12,3 +12,11 @@ crons = ["* * * * *"]
 binding = "DB"
 database_name = "convx-discord-assistant"
 database_id = "9da42b8b-4129-40bf-b19a-d76acb7ee801"
+
+[[durable_objects.bindings]]
+name = "DISCORD_GATEWAY"
+class_name = "DiscordGateway"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DiscordGateway"]
