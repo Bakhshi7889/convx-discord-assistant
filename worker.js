@@ -17,7 +17,24 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r13";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r14";
+const CONVY_CURRENT_RELEASE_NOTES = [
+  "Added runtime-injected Git commit, source commit timestamp, deployment timestamp, and deployment-run link, plus !version and !changes commands.",
+  "Added image search with visible image embeds and source links using DuckDuckGo, with Wikimedia Commons fallback and attribution metadata where available."
+];
+const CONVY_RELEASE_HISTORY = [
+  {
+    version: "convx-2026-10-18-r13",
+    appliedAt: "2026-10-18T16:29:38Z",
+    commit: "2e8b3c84ece5bb2e05d1c671f3bfbafe43b8953e",
+    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39145200553",
+    changes: [
+      "Added a rolling per-channel conversation buffer including CONVY's own replies and owner-saved long-term memories.",
+      "Added creator-only pause/resume, persistent model-response settings, web search, and public Discord profile inspection.",
+      "Removed fixed canned roast lines and improved natural conversational continuity."
+    ]
+  }
+];
 const CONVY_RELEASE_NOTES = [
   "Added recent channel conversation context, saved CONVY replies, and owner-approved long-term memories.",
   "Added creator-only pause/resume, persistent runtime settings, web search, and public Discord profile inspection.",
@@ -87,6 +104,34 @@ async function discord(env, path, options = {}) {
   }
   if (response.status === 204) return null;
   return response.json();
+}
+function buildMetadata(env = {}) {
+  return {
+    version: String(env.BUILD_VERSION || CONVY_BUILD_VERSION),
+    commit: String(env.BUILD_COMMIT || ""),
+    sourceCommitAt: String(env.BUILD_COMMIT_AT || ""),
+    appliedAt: String(env.BUILD_APPLIED_AT || ""),
+    deploymentUrl: String(env.BUILD_DEPLOYMENT_URL || ""),
+    status: env.BUILD_APPLIED_AT ? "deployed via GitHub Actions" : "deployment metadata unavailable"
+  };
+}
+function buildMetadataText(env, includeChanges = false) {
+  const b = buildMetadata(env);
+  const lines = [
+    "Version: " + b.version,
+    "Git commit: " + (b.commit || "(not supplied by deployment workflow)"),
+    "Source commit time (UTC): " + (b.sourceCommitAt || "(not supplied)"),
+    "Deployment initiated (UTC): " + (b.appliedAt || "(not supplied)"),
+    "Deployment status: " + b.status,
+    "Commit URL: " + (b.commit ? "https://github.com/Bakhshi7889/convx-discord-assistant/commit/" + b.commit : "(not available)"),
+    "Deployment run: " + (b.deploymentUrl || "(not available)")
+  ];
+  if (includeChanges) {
+    lines.push("Changes in this release:\n- " + CONVY_CURRENT_RELEASE_NOTES.join("\n- "));
+    const previous = CONVY_RELEASE_HISTORY[0];
+    lines.push("Previous recorded release:\n- " + previous.version + " · applied " + previous.appliedAt + "\n- " + previous.changes.join("\n- ") + "\n- Commit: " + previous.commit + "\n- Deployment: " + previous.deploymentUrl);
+  }
+  return lines.join("\n");
 }
 function isCreator(message) {
   return String(message?.author?.id || "") === CONVY_CREATOR_USER_ID;
@@ -646,10 +691,11 @@ function safeTuningArgs(raw, current, locked = {}) {
   return { settings: next, result: { ok: true, scope: "this reply only; creator-locked values stay unchanged", changed: changes, settings: next, reason: String(args.reason || "").slice(0, 160) } };
 }
 
-function withRuntimeSnapshot(messages, modelId, settings, hasImages, tuningEnabled, ownerSelectedId) {
+function withRuntimeSnapshot(env, messages, modelId, settings, hasImages, tuningEnabled, ownerSelectedId) {
   const runtime = [
     "LIVE RUNTIME SNAPSHOT (authoritative for this request; use it instead of guessing):",
-    "Build: " + CONVY_BUILD_VERSION,
+    "Build: " + buildMetadata(env).version,
+    "Build metadata:\n" + buildMetadataText(env, false),
     "Actual model handling this attempt: " + modelId,
     "Owner-selected model override: " + (ownerSelectedId || "AUTO (preferred order)"),
     "Preferred model order: " + PREFERRED_MODEL_ORDER.join(" -> "),
@@ -725,7 +771,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
       let conversation = [...messages];
 
       const postCompletion = async (inputMessages, useTools) => {
-        const requestMessages = withRuntimeSnapshot(inputMessages, id, currentSettings, hasImages, tuningEnabled, ownerSelectedId);
+        const requestMessages = withRuntimeSnapshot(env, inputMessages, id, currentSettings, hasImages, tuningEnabled, ownerSelectedId);
         const body = {
           model: id,
           messages: requestMessages,
@@ -796,7 +842,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
 
         // Rebuild the runtime snapshot after tuning, then force a normal answer rather than
         // allowing an endless tool loop.
-        const finalMessages = withRuntimeSnapshot(conversation, id, currentSettings, hasImages, tuningEnabled, ownerSelectedId);
+        const finalMessages = withRuntimeSnapshot(env, conversation, id, currentSettings, hasImages, tuningEnabled, ownerSelectedId);
         response = await fetch(POLLINATIONS_API + "/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -1535,6 +1581,14 @@ async function handleMention(env, message) {
     await sendUserReply(env, message, "**Recent context (" + items.length + " messages)**\n" + (transcript || "(none saved yet)"), message.id);
     return;
   }
+  if (command === "!version") {
+    await sendUserReply(env, message, "**CONVY build metadata**\n" + buildMetadataText(env, false), message.id);
+    return;
+  }
+  if (command === "!changes") {
+    await sendUserReply(env, message, "**CONVY release notes**\n" + buildMetadataText(env, true), message.id);
+    return;
+  }
   if (command === "!runtime") {
     if (!(await isAdmin(env, message))) {
       await sendUserReply(env, message, "Nope. !runtime is admin-only.", message.id);
@@ -1543,12 +1597,12 @@ async function handleMention(env, message) {
     const preferred = await setting(env.DB, "preferred_model_id") || "(no successful model recorded yet)";
     const notes = CONVY_RELEASE_NOTES.map((note, index) => (index + 1) + ". " + note).join("\n");
     const content = "**CONVY runtime snapshot**\n" +
-      "**Build:** " + CONVY_BUILD_VERSION + "\n" +
+      buildMetadataText(env, false) + "\n" +
       "**Last successful model:** " + preferred + "\n" +
       "**Routing order:** " + PREFERRED_MODEL_ORDER.join(" → ") + "\n" +
       "**Self-tuning:** first two preferred models may adjust reasoning effort, temperature, and output-token budget for one reply only. Nothing persists and no model can override the routing order.\n" +
       "**Creator/maintainer:** <@" + CONVY_CREATOR_USER_ID + ">\n" +
-      "**Known changes in this build:**\n" + notes;
+      "**Changes in this release:**\n" + CONVY_CURRENT_RELEASE_NOTES.map((note, index) => (index + 1) + ". " + note).join("\n") + "\n\n**Known capabilities:**\n" + notes;
     await sendUserReply(env, message, content, message.id);
     return;
   }
@@ -2338,6 +2392,7 @@ export default {
         ok: true,
         gateway: gatewayStatus,
         service: "convx-discord-assistant",
+        build: { ...buildMetadata(env), currentReleaseNotes: CONVY_CURRENT_RELEASE_NOTES },
         configured: {
           discordToken: Boolean(env.DISCORD_TOKEN),
           pollinationsKey: Boolean(env.POLLINATIONS_API_KEY),
