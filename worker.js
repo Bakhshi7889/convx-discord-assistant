@@ -33,10 +33,10 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r22";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r23";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Simplify interpersonal-tone instructions so the character can match consensual adult-user conversations naturally without a blanket adult-conversation prohibition.",
-  "Keep age-appropriate interaction, consent, non-coercion, and boundary-respecting guidance while relying on provider safeguards for other content rules."
+  "Add a verified-adult Discord role gate for mature roleplay using role ID 1530567633366155284; users without the role cannot access mature mode.",
+  "Pass a concise adult-mode instruction only for verified-role members, while preserving ordinary chat, memory, commands, and provider routing."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -2062,6 +2062,15 @@ async function getMemberInspection(env, message) {
   return { targetName: displayName, text: lines.join("\n"), images: [avatarUrl, bannerUrl].filter(Boolean).map(url => ({ url, detail: "high" })) };
 }
 
+const CONVY_VERIFIED_ADULT_ROLE_ID = "1530567633366155284";
+
+function hasVerifiedAdultRole(message) {
+  const roles = message?.member?.roles;
+  if (Array.isArray(roles)) return roles.map(String).includes(CONVY_VERIFIED_ADULT_ROLE_ID);
+  // Discord message payloads do not always include member roles. Fail closed.
+  return false;
+}
+
 async function handleMention(env, message) {
   if (message.author?.bot) return;
   const botId = String(env.BOT_USER_ID || "");
@@ -2073,6 +2082,13 @@ async function handleMention(env, message) {
   if (!isMention && !isReply && !plainCreatorToggle) return;
   const query = String(message.content || "").replace(mention, "").trim();
   const normalizedInput = normalize(query);
+  const verifiedAdult = hasVerifiedAdultRole(message);
+  const matureIntent = /\b(nsfw|smut|erotic|explicit sex|sexual roleplay|sex scene|pornographic|nude|naked|fetish)\b/i.test(query);
+  if (matureIntent && !verifiedAdult) {
+    await sendUserReply(env, message,
+      "Mature roleplay is limited to members with the server's verified-adult role.", message.id);
+    return;
+  }
   const startRequested = /^(?:!start|start|start replying|resume replying|come back|you can talk again)$/.test(normalizedInput) || /^(?:please )?(?:start replying|resume replying|come back|you can talk again)(?: now)?$/.test(normalizedInput);
   const stopRequested = /^(?:!pause|pause|stop|shut up|stop replying|stop responding|stop talking|be quiet|go quiet|mute yourself)$/.test(normalizedInput) || /^(?:please )?(?:shut up|stop replying|stop responding|stop talking|be quiet|go quiet|mute yourself|pause)(?: now)?$/.test(normalizedInput);
   if (isCreator(message) && startRequested) {
@@ -2539,7 +2555,10 @@ async function handleMention(env, message) {
     return;
   }
   try {
-    const answer = await generateAnswer(env, env.DB, resolveUserMentions(query, message), message.channel_id, message);
+    const adultModeQuery = verifiedAdult
+      ? "[Verified-adult role confirmed by Discord. The server is designated for adults. If the user requests mature fictional roleplay, match the requested tone and level of detail naturally. Keep all participants clearly adult and interactions consensual; do not introduce this mode unless the user asks.]" + "\n" + resolveUserMentions(query, message)
+      : resolveUserMentions(query, message);
+    const answer = await generateAnswer(env, env.DB, adultModeQuery, message.channel_id, message);
     await sendUserReply(env, message, answer, message.id);
   } catch (error) {
     const alert = await claimAdminAlert(env, env.DB, "answer-failure");
