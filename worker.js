@@ -17,7 +17,7 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r11";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r12";
 const CONVY_RELEASE_NOTES = [
   "Added recent channel conversation context, saved CONVY replies, and owner-approved long-term memories.",
   "Added creator-only pause/resume, persistent runtime settings, web search, and public Discord profile inspection.",
@@ -1290,11 +1290,12 @@ async function handleMention(env, message) {
   const mention = new RegExp("<@!?" + botId + ">");
   const isMention = mention.test(message.content || "");
   const isReply = await isReplyToBot(env, message);
-  if (!isMention && !isReply) return;
+  const plainCreatorToggle = isCreator(message) && /^(?:!pause|!start|pause|stop|shut up|stop replying|stop responding|stop talking|be quiet|go quiet|mute yourself|start replying|resume replying|come back|you can talk again)(?: now)?$/i.test(String(message.content || "").trim());
+  if (!isMention && !isReply && !plainCreatorToggle) return;
   const query = String(message.content || "").replace(mention, "").trim();
   const normalizedInput = normalize(query);
-  const startRequested = /^!start$/.test(normalizedInput) || /^(?:please )?(?:start replying|resume replying|come back|you can talk again)(?: now)?$/.test(normalizedInput);
-  const stopRequested = /^!pause$/.test(normalizedInput) || /^(?:please )?(?:shut up|stop replying|stop responding|stop talking|be quiet|go quiet|mute yourself|pause)(?: now)?$/.test(normalizedInput);
+  const startRequested = /^(?:!start|start|start replying|resume replying|come back|you can talk again)$/.test(normalizedInput) || /^(?:please )?(?:start replying|resume replying|come back|you can talk again)(?: now)?$/.test(normalizedInput);
+  const stopRequested = /^(?:!pause|pause|stop|shut up|stop replying|stop responding|stop talking|be quiet|go quiet|mute yourself)$/.test(normalizedInput) || /^(?:please )?(?:shut up|stop replying|stop responding|stop talking|be quiet|go quiet|mute yourself|pause)(?: now)?$/.test(normalizedInput);
   if (isCreator(message) && startRequested) {
     try {
       await setBotPaused(env, false, message.author.id);
@@ -1985,6 +1986,7 @@ export class DiscordGateway extends DurableObject {
     this.reconnectAttempts = 0;
     this.lastError = "";
     this.inFlightMessages = new Set();
+    this.contextWriteChain = Promise.resolve();
   }
 
   async fetch(request) {
@@ -2011,23 +2013,13 @@ export class DiscordGateway extends DurableObject {
       if (!/^\d{15,22}$/.test(String(row.channel_id || "")) || !/^\d{15,22}$/.test(String(row.id || "")) || !/^\d{15,22}$/.test(String(row.author_id || ""))) {
         return json({ ok: false, error: "Invalid message context payload." }, 400);
       }
-      const key = "recent_context:" + String(row.channel_id);
-      const list = (await this.ctx.storage.get(key)) || [];
-      if (!list.some(item => String(item.id) === String(row.id))) {
-        list.push({
-          id: String(row.id), channel_id: String(row.channel_id), author_id: String(row.author_id),
-          author_name: String(row.author_name || "Discord user").slice(0, 80),
-          content: String(row.content || "").slice(0, 1200),
-          created_at: String(row.created_at || new Date().toISOString()),
-          message_url: String(row.message_url || "").slice(0, 500)
-        });
+      try {
+        await this.appendRecentContext(row);
+        const list = (await this.ctx.storage.get("recent_context:" + String(row.channel_id))) || [];
+        return json({ ok: true, count: list.length });
+      } catch (error) {
+        return json({ ok: false, error: String(error.message || error).slice(0, 140) }, 500);
       }
-      list.sort((a, b) => {
-        try { const aa = BigInt(a.id), bb = BigInt(b.id); return aa < bb ? -1 : aa > bb ? 1 : 0; }
-        catch { return String(a.created_at).localeCompare(String(b.created_at)); }
-      });
-      await this.ctx.storage.put(key, list.slice(-24));
-      return json({ ok: true, count: Math.min(24, list.length) });
     }
     if (path === "/control/status") {
       return json({ ok: true, paused: Boolean(await this.ctx.storage.get("convx_paused")), changedAt: await this.ctx.storage.get("convx_pause_changed_at") || null });
@@ -2257,22 +2249,27 @@ export class DiscordGateway extends DurableObject {
   }
 
   async appendRecentContext(message) {
-    if (!message?.id || !message?.channel_id || !message?.author?.id || !String(message.content || "").trim()) return;
-    const key = "recent_context:" + String(message.channel_id);
-    const list = (await this.ctx.storage.get(key)) || [];
+    const authorId = String(message?.author?.id || message?.author_id || "");
+    if (!message?.id || !message?.channel_id || !authorId || !String(message.content || "").trim()) return;
     const row = {
-      id: String(message.id), channel_id: String(message.channel_id), author_id: String(message.author.id),
-      author_name: String(message.member?.nick || message.author.global_name || message.author.username || "Discord user").slice(0, 80),
+      id: String(message.id), channel_id: String(message.channel_id), author_id: authorId,
+      author_name: String(message.member?.nick || message.author?.global_name || message.author?.username || message.author_name || "Discord user").slice(0, 80),
       content: String(message.content || "").slice(0, 1200),
-      created_at: String(message.timestamp || new Date().toISOString()),
-      message_url: "https://discord.com/channels/" + String(message.guild_id || "@me") + "/" + String(message.channel_id) + "/" + String(message.id)
+      created_at: String(message.timestamp || message.created_at || new Date().toISOString()),
+      message_url: String(message.message_url || ("https://discord.com/channels/" + String(message.guild_id || this.env.GUILD_ID || "@me") + "/" + String(message.channel_id) + "/" + String(message.id))).slice(0, 500)
     };
-    if (!list.some(item => String(item.id) === row.id)) list.push(row);
-    list.sort((a, b) => {
-      try { const aa = BigInt(a.id), bb = BigInt(b.id); return aa < bb ? -1 : aa > bb ? 1 : 0; }
-      catch { return String(a.created_at).localeCompare(String(b.created_at)); }
-    });
-    await this.ctx.storage.put(key, list.slice(-24));
+    const write = async () => {
+      const key = "recent_context:" + row.channel_id;
+      const list = (await this.ctx.storage.get(key)) || [];
+      if (!list.some(item => String(item.id) === row.id)) list.push(row);
+      list.sort((a, b) => {
+        try { const aa = BigInt(a.id), bb = BigInt(b.id); return aa < bb ? -1 : aa > bb ? 1 : 0; }
+        catch { return String(a.created_at).localeCompare(String(b.created_at)); }
+      });
+      await this.ctx.storage.put(key, list.slice(-24));
+    };
+    this.contextWriteChain = (this.contextWriteChain || Promise.resolve()).then(write, write);
+    await this.contextWriteChain;
   }
 
   async processMessage(message) {
@@ -2285,7 +2282,9 @@ export class DiscordGateway extends DurableObject {
     const mentioned = isBotMention(this.env, message);
     // Replying directly to a CONVY message is an implicit address, even without @mention.
     const repliedToBot = !mentioned && await isReplyToBot(this.env, message);
-    if (!mentioned && !repliedToBot) return;
+    const text = normalize(message.content || "");
+    const ownerControl = isCreator(message) && /^(?:!pause|!start|pause|stop|shut up|stop replying|stop responding|stop talking|be quiet|go quiet|mute yourself|start replying|resume replying|come back|you can talk again)(?: now)?$/.test(text);
+    if (!mentioned && !repliedToBot && !ownerControl) return;
 
     const messageId = String(message.id || "");
     if (!messageId || this.inFlightMessages.has(messageId)) return;
