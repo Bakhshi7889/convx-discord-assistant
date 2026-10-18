@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
 // Refreshing the full model catalog rewrites many D1 rows. Daily is enough for a free-tier bot.
-const MODEL_CACHE_MS = 24 * 60 * 60 * 1000;
+const MODEL_CACHE_MS = 24 * 60 * 60 * 1000; // Keep catalog writes comfortably below D1's free daily quota.
 const MODEL_ATTEMPT_LIMIT = 2;
 const MODEL_TIMEOUT_MS = 5000;
 const MAX_REPLY = 1850;
@@ -49,7 +49,8 @@ async function saveMessage(env, db, m) {
   await db.prepare(
     "INSERT INTO messages(message_id,channel_id,author_id,author_name,content,created_at,message_url) " +
     "VALUES(?,?,?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET " +
-    "author_name=excluded.author_name,content=excluded.content"
+    "author_name=excluded.author_name,content=excluded.content " +
+    "WHERE messages.author_name<>excluded.author_name OR messages.content<>excluded.content"
   ).bind(
     m.id, m.channel_id, m.author.id, name, m.content,
     m.timestamp || new Date().toISOString(), url
@@ -117,10 +118,16 @@ function mentionText(targets) {
 async function claimAdminAlert(env, db, category, cooldownMs = 60 * 60 * 1000) {
   const targets = adminMentionTargets(env);
   if (!targets.users.length && !targets.roles.length) return null;
-  const key = "admin_alert_ms:" + category, last = Number(await setting(db, key) || 0);
-  if (Date.now() - last < cooldownMs) return null;
-  await setSetting(db, key, Date.now());
-  return { targets, mentions: mentionText(targets) };
+  try {
+    const key = "admin_alert_ms:" + category, last = Number(await setting(db, key) || 0);
+    if (Date.now() - last < cooldownMs) return null;
+    await setSetting(db, key, Date.now());
+    return { targets, mentions: mentionText(targets) };
+  } catch (error) {
+    // Alert throttling must not prevent the original request from receiving an answer.
+    console.log("Admin alert cooldown write skipped: " + String(error.message || error).slice(0, 100));
+    return null;
+  }
 }
 async function postAdminAlert(env, db, category, details) {
   const alert = await claimAdminAlert(env, db, category);
@@ -359,37 +366,70 @@ function sortModelRows(rows) {
 }
 
 async function models(db, force=false) {
-  const last=Number(await setting(db,"model_checked_ms")||0);
-  const filterVersion=await setting(db,"model_filter_version");
-  if(!force&&filterVersion==="2"&&Date.now()-last<MODEL_CACHE_MS){
-    const cached=await db.prepare("SELECT model_id,source,health,success_rate,request_count,avg_latency_ms,local_success_count,local_failure_count FROM models WHERE eligible=1").all();
-    return sortModelRows(cached.results||[]);
+  const readCached = async () => {
+    const rows = await db.prepare(
+      "SELECT model_id,source,health,success_rate,request_count,avg_latency_ms,local_success_count,local_failure_count FROM models WHERE eligible=1"
+    ).all();
+    return sortModelRows(rows.results || []);
+  };
+  const last = Number(await setting(db, "model_checked_ms") || 0);
+  const filterVersion = await setting(db, "model_filter_version");
+  const cached = await readCached();
+  if (!force && filterVersion === "2" && Date.now() - last < MODEL_CACHE_MS && cached.length) {
+    return cached;
   }
-  const response=await fetch(POLLINATIONS_API+"/text/models?community=true&reliability=all",{headers:{"accept":"application/json"},signal:AbortSignal.timeout(10000)});
-  if(!response.ok)throw new Error("Pollinations model catalog returned HTTP "+response.status);
-  const all=catalogModels(await response.json()), eligible=[];
-  for(const model of all){
-    if(!verifiedFreeTextModel(model))continue;
-    const id=String(model.id||model.name||"").trim();if(!id)continue;
-    const h=modelHealth(model),source=String(model.source||"community").toLowerCase(),p=modelPrices(model);
-    eligible.push({id,source,status:h.status,success:h.success,requests:h.requests,input:p.input??0,output:p.output??0});
+
+  try {
+    const response = await fetch(POLLINATIONS_API + "/text/models?community=true&reliability=all", {
+      headers: { "accept": "application/json" },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!response.ok) throw new Error("Pollinations model catalog returned HTTP " + response.status);
+    const all = catalogModels(await response.json()), eligible = [];
+    for (const model of all) {
+      if (!verifiedFreeTextModel(model)) continue;
+      const id = String(model.id || model.name || "").trim();
+      if (!id) continue;
+      const h = modelHealth(model), source = String(model.source || "community").toLowerCase(), p = modelPrices(model);
+      eligible.push({ id, source, status: h.status, success: h.success, requests: h.requests, input: p.input ?? 0, output: p.output ?? 0 });
+    }
+    if (!eligible.length && cached.length) return cached;
+
+    await db.prepare("UPDATE models SET eligible=0").run();
+    for (const m of eligible) {
+      await db.prepare(
+        "INSERT INTO models(model_id,source,prompt_price,completion_price,health,success_rate,request_count,checked_at,eligible) " +
+        "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,1) ON CONFLICT(model_id) DO UPDATE SET " +
+        "source=excluded.source,prompt_price=excluded.prompt_price,completion_price=excluded.completion_price," +
+        "health=excluded.health,success_rate=excluded.success_rate,request_count=excluded.request_count," +
+        "checked_at=CURRENT_TIMESTAMP,eligible=1"
+      ).bind(m.id, m.source, m.input, m.output, m.status, m.success, m.requests).run();
+    }
+    await setSetting(db, "model_filter_version", "2");
+    await setSetting(db, "model_checked_ms", Date.now());
+    const refreshed = await readCached();
+    return refreshed.length ? refreshed : cached;
+  } catch (error) {
+    if (cached.length) {
+      // D1 row-write limits should not take down chat when a usable free-model cache exists.
+      console.log("Model catalog refresh skipped; using cached free models: " + String(error.message || error).slice(0, 120));
+      return cached;
+    }
+    throw error;
   }
-  await db.prepare("UPDATE models SET eligible=0").run();
-  for(const m of eligible)await db.prepare("INSERT INTO models(model_id,source,prompt_price,completion_price,health,success_rate,request_count,checked_at,eligible) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,1) ON CONFLICT(model_id) DO UPDATE SET source=excluded.source,prompt_price=excluded.prompt_price,completion_price=excluded.completion_price,health=excluded.health,success_rate=excluded.success_rate,request_count=excluded.request_count,checked_at=CURRENT_TIMESTAMP,eligible=1")
-    .bind(m.id,m.source,m.input,m.output,m.status,m.success,m.requests).run();
-  await setSetting(db,"model_filter_version","2");
-  await setSetting(db,"model_checked_ms",Date.now());
-  const cached=await db.prepare("SELECT model_id,source,health,success_rate,request_count,avg_latency_ms,local_success_count,local_failure_count FROM models WHERE eligible=1").all();
-  return sortModelRows(cached.results||[]);
 }
 async function recordModelResult(db,id,elapsed,succeeded) {
   const ms = Math.max(0, Math.round(Number(elapsed) || 0));
-  // Track elapsed time for failures too; otherwise broken models look mysteriously fast forever.
-  await db.prepare(
-    "UPDATE models SET avg_latency_ms=CASE WHEN avg_latency_ms<=0 THEN ? ELSE (avg_latency_ms*0.7+?*0.3) END," +
-    "local_success_count=local_success_count+CASE WHEN ? THEN 1 ELSE 0 END," +
-    "local_failure_count=local_failure_count+CASE WHEN ? THEN 0 ELSE 1 END WHERE model_id=?"
-  ).bind(ms, ms, succeeded ? 1 : 0, succeeded ? 1 : 0, id).run();
+  // Observability is optional. Never let a full D1 quota discard an otherwise valid AI answer.
+  try {
+    await db.prepare(
+      "UPDATE models SET avg_latency_ms=CASE WHEN avg_latency_ms<=0 THEN ? ELSE (avg_latency_ms*0.7+?*0.3) END," +
+      "local_success_count=local_success_count+CASE WHEN ? THEN 1 ELSE 0 END," +
+      "local_failure_count=local_failure_count+CASE WHEN ? THEN 0 ELSE 1 END WHERE model_id=?"
+    ).bind(ms, ms, succeeded ? 1 : 0, succeeded ? 1 : 0, id).run();
+  } catch (error) {
+    console.log("Model metrics write skipped: " + String(error.message || error).slice(0, 100));
+  }
 }
 
 async function callFreeModel(env,db,messages,maxTokens=550) {
@@ -446,8 +486,12 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
       await recordModelResult(db, id, Date.now() - started, succeeded);
       recorded = true;
       if (succeeded) {
-        await setSetting(db, "preferred_model_id", id);
-        await setSetting(db, "preferred_model_last_success_ms", Date.now());
+        try {
+          await setSetting(db, "preferred_model_id", id);
+          await setSetting(db, "preferred_model_last_success_ms", Date.now());
+        } catch (error) {
+          console.log("Preferred-model metadata write skipped: " + String(error.message || error).slice(0, 100));
+        }
         return { content: answer.trim(), modelId: id };
       }
       lastFailure = id + " returned an empty answer.";
@@ -902,27 +946,34 @@ async function backfillHistory(env) {
   const db = env.DB;
   if (await setting(db, "history_sync_state") !== "running") return;
   let before = await setting(db, "history_sync_before");
-  for (let page = 0; page < 4; page++) {
-    let batch;
-    try {
-      batch = await fetchChannelMessages(env, env.TARGET_CHANNEL_ID, before ? { before } : {});
-    } catch (error) {
-      console.log("History backfill paused: " + String(error.message || error).slice(0, 150));
+  // The old job imported up to 400 messages per minute, enough to exhaust a free D1 quota.
+  // Keep an explicitly requested history sync to 10 messages per cron run.
+  let batch;
+  try {
+    batch = await fetchChannelMessages(env, env.TARGET_CHANNEL_ID, before
+      ? { before, limit: "10" }
+      : { limit: "10" });
+  } catch (error) {
+    console.log("History backfill paused: " + String(error.message || error).slice(0, 150));
+    return;
+  }
+  if (!Array.isArray(batch) || batch.length === 0) {
+    await setSetting(db, "history_sync_state", "complete");
+    await setSetting(db, "history_sync_before", "");
+    return;
+  }
+  for (const message of batch) {
+    try { await saveMessage(env, db, message); }
+    catch (error) {
+      console.log("History backfill paused on D1 write limit: " + String(error.message || error).slice(0, 120));
       return;
     }
-    if (!Array.isArray(batch) || batch.length === 0) {
-      await setSetting(db, "history_sync_state", "complete");
-      await setSetting(db, "history_sync_before", "");
-      return;
-    }
-    for (const message of batch) await saveMessage(env, db, message);
-    before = batch[batch.length - 1].id;
-    await setSetting(db, "history_sync_before", before);
-    if (batch.length < 100) {
-      await setSetting(db, "history_sync_state", "complete");
-      await setSetting(db, "history_sync_before", "");
-      return;
-    }
+  }
+  before = batch[batch.length - 1].id;
+  await setSetting(db, "history_sync_before", before);
+  if (batch.length < 10) {
+    await setSetting(db, "history_sync_state", "complete");
+    await setSetting(db, "history_sync_before", "");
   }
 }
 function isBotMention(env, message) {
@@ -1131,6 +1182,7 @@ export class DiscordGateway extends DurableObject {
     this.heartbeatAck = true;
     this.reconnectAttempts = 0;
     this.lastError = "";
+    this.inFlightMessages = new Set();
   }
 
   async fetch(request) {
@@ -1363,13 +1415,34 @@ export class DiscordGateway extends DurableObject {
 
   async processMessage(message) {
     if (!message || message.guild_id !== String(this.env.GUILD_ID || "") || message.author?.bot) return;
-    // Do not write every ordinary server message to D1. Store messages that actually
-    // invoke CONVY; replied-to source messages are fetched and saved on demand.
     if (!isBotMention(this.env, message)) return;
-    await saveMessage(this.env, this.env.DB, message);
-    const claimed = await claimMentionOnce(this.env.DB, message);
-    if (!claimed) return;
-    await handleMention(this.env, message);
+
+    const messageId = String(message.id || "");
+    if (!messageId || this.inFlightMessages.has(messageId)) return;
+    this.inFlightMessages.add(messageId);
+    try {
+      // Durable Object storage handles deduplication without consuming D1 row writes.
+      const key = "gateway_handled_message:" + messageId;
+      let alreadyHandled = false;
+      try { alreadyHandled = Boolean(await this.ctx.storage.get(key)); }
+      catch (error) {
+        console.log("Gateway dedup read skipped: " + String(error.message || error).slice(0, 100));
+      }
+      if (alreadyHandled) return;
+      try { await this.ctx.storage.put(key, Date.now()); }
+      catch (error) {
+        console.log("Gateway dedup write skipped: " + String(error.message || error).slice(0, 100));
+      }
+
+      // Persist history best-effort. An exhausted D1 quota must never block a chat reply.
+      try { await saveMessage(this.env, this.env.DB, message); }
+      catch (error) {
+        console.log("Message history write skipped: " + String(error.message || error).slice(0, 120));
+      }
+      await handleMention(this.env, message);
+    } finally {
+      this.inFlightMessages.delete(messageId);
+    }
   }
 }
 
