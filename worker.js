@@ -920,6 +920,8 @@ async function pollOneChannel(env, db, channel) {
         try { claimed = await claimMentionOnce(db, message); }
         catch (error) {
           console.log("Could not claim mention (" + channelId + "): " + String(error.message || error).slice(0, 120));
+          // Fail open on a database hiccup so a valid user message is not silently dropped.
+          claimed = true;
         }
         if (!claimed) {
           // Overlapping scheduled runs can see the same input. One wins; others skip the duplicate.
