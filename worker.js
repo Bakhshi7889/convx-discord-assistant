@@ -1,8 +1,8 @@
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
 const MODEL_CACHE_MS = 60 * 60 * 1000;
-const MODEL_ATTEMPT_LIMIT = 8;
-const MODEL_TIMEOUT_MS = 9000;
+const MODEL_ATTEMPT_LIMIT = 3;
+const MODEL_TIMEOUT_MS = 6500;
 const MAX_REPLY = 1850;
 const MAX_CHANNELS_PER_RUN = 20;
 
