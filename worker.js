@@ -603,7 +603,7 @@ async function handleMention(env, message) {
   }
   if (command === "!help") {
     await sendReply(env, message.channel_id,
-      "I'm CONVY (she/her), Convx's sarcastic resident AI. I answer questions, use the approved server notes, remember useful conversations when admins ask, and occasionally roast the logic that brought us here.\n\nMention me with a question. Ask me to \"roast @member\" for playful teasing; I'll roast the choices, not someone's identity.\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
+      "I'm CONVY (she/her), Convx's assistant: sharp, useful, and mildly allergic to nonsense. I answer questions without the theatrical monologues.\n\nMention me with a question. For a short roast, use \"@CONVY roast @member\".\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
     return;
   }
   if (isSaveRequest(command)) {
@@ -664,37 +664,43 @@ async function handleMention(env, message) {
       return;
     }
     try {
-      const pool = await models(env.DB, true);
+      const catalogPool = await models(env.DB, true);
+      const pool = catalogPool.filter(model => statusRank(model.health) === 0);
       const preferredId = await setting(env.DB, "preferred_model_id");
       const lines = pool.map((model, index) => {
         const score = modelScore(model);
         const provider = model.success_rate == null
           ? "provider success n/a"
           : "provider " + Math.round(100 * model.success_rate) + "%";
-        const localRate = localModelSuccessRate(model);
-        const tests = (Number(model.local_success_count) || 0) + (Number(model.local_failure_count) || 0);
+        const successes = Number(model.local_success_count) || 0;
+        const failures = Number(model.local_failure_count) || 0;
+        const tests = successes + failures;
         const local = tests > 0
-          ? "CONVY " + Math.round(100 * localRate) + "% (" + model.local_success_count + "/" + tests + ")"
-          : "CONVY test data pending";
+          ? "CONVY " + Math.round(100 * successes / tests) + "% (" + successes + "/" + tests + ")"
+          : "CONVY test pending";
         const latency = Number(model.avg_latency_ms) > 0
           ? "~" + Math.round(model.avg_latency_ms) + "ms"
           : "speed unmeasured";
-        const preferred = model.model_id === preferredId && (Number(model.local_success_count) || 0) > (Number(model.local_failure_count) || 0);
+        const benchmark = externalModelBenchmark(model);
+        const benchmarkText = benchmark
+          ? benchmark.label + " · " + benchmark.elo + " ELO"
+          : "Arena unranked";
+        const preferred = model.model_id === preferredId && successes > failures;
         return "#" + (index + 1) + " · **" + score + "/100** · " + statusEmoji(model.health) +
           " " + model.model_id + (preferred ? " · ★ CONVY default" : "") +
-          " · " + provider + " · " + local + " · " + latency + " · " + model.source;
+          " · " + provider + " · " + local + " · " + latency + " · " + benchmarkText;
       });
-      const intro = "**CONVY's verified-free text model leaderboard**\n" +
-        "Found " + pool.length + " model(s). Ranked by score /100: provider health (30), provider success (25), CONVY's smoothed observed success (25), speed (15), and provider sample confidence (5). The ★ marks the current CONVY default. New models get provisional scores until tested.\n" +
-        "Only community text models with no billed text-token rates qualify. Models marked paid_only or with positive/unknown text rates are excluded. No paid fallback. Catalog refreshed now; normal refresh is hourly.\n\n";
-      await sendReply(env, message.channel_id,
-        pool.length ? intro + lines.join("\n") :
-          "Pollinations returned no community text models with no billed text-token rates. I'm not going to sneak a paid model into the queue just to make the leaderboard look impressive. The catalog may have changed, or the free community models may be unavailable. No paid model will be used.",
-        message.id);
+      const intro = "**CONVY's green-only model leaderboard**\n" +
+        "Showing " + pool.length + " healthy/green models. Red/down, yellow/degraded and unknown-health models are hidden. Agent wrappers are excluded from the free pool to avoid billable child calls.\n" +
+        "Score /100 = provider health (20), provider success (20), smoothed CONVY success (25), Text Arena family prior (25), and speed (10). The star marks CONVY's proven default. Arena data is the open-source text leaderboard snapshot from 15 Oct 2026; family scores are a prior, not a guarantee about each host.\n" +
+        "Only community text models with no billed text-token rates are listed. No paid fallback. Source: https://arena.ai/leaderboard/chat/text?license=open-source\n\n";
+      const content = pool.length
+        ? intro + lines.join("\n")
+        : "**No green models right now.** Red, yellow and unknown providers are hidden rather than decorated with optimism. CONVY can retry eligible degraded models for a reply, but will not attempt anything marked down or paid-only.";
+      await sendReply(env, message.channel_id, content, message.id);
     } catch (error) {
       await sendReply(env, message.channel_id,
-        "I couldn't refresh the model catalog. The model leaderboard is having a spectacularly unhelpful day: " +
-        String(error.message || error).slice(0, 180), message.id);
+        "I couldn't refresh the green-model leaderboard: " + String(error.message || error).slice(0, 180), message.id);
     }
     return;
   }
