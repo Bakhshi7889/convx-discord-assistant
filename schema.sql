@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS models (
   success_rate REAL,
   request_count INTEGER NOT NULL DEFAULT 0,
   checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  eligible INTEGER NOT NULL DEFAULT 0
+  eligible INTEGER NOT NULL DEFAULT 0,
+  avg_latency_ms REAL NOT NULL DEFAULT 0,
+  local_success_count INTEGER NOT NULL DEFAULT 0,
+  local_failure_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS settings (
