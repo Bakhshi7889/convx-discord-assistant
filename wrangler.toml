@@ -8,6 +8,13 @@ enabled = true
 [triggers]
 crons = ["* * * * *"]
 
+[vars]
+BOT_USER_ID = "1561087820372644042"
+GUILD_ID = "1530241653351256134"
+TARGET_CHANNEL_ID = "1530567706754158843"
+ADMIN_ROLE_IDS = "1530567627783540799"
+ADMIN_USER_IDS = "856033880405573632"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "convx-discord-assistant"
