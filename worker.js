@@ -1,3 +1,5 @@
+import { DurableObject } from "cloudflare:workers";
+
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
 const MODEL_CACHE_MS = 60 * 60 * 1000;
@@ -1091,6 +1093,266 @@ async function pollNewMessages(env) {
   // Full historical backfill remains focused on the configured primary channel.
   await backfillHistory(env);
 }
+
+async function startGateway(env) {
+  if (!env.DISCORD_GATEWAY) throw new Error("Discord Gateway Durable Object binding is missing.");
+  const id = env.DISCORD_GATEWAY.idFromName("convx-discord-gateway");
+  const stub = env.DISCORD_GATEWAY.get(id);
+  const response = await stub.fetch("https://gateway/connect", { method: "POST" });
+  if (!response.ok) throw new Error("Gateway supervisor returned HTTP " + response.status);
+  return response.json();
+}
+
+export class DiscordGateway extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx = ctx;
+    this.env = env;
+    this.socket = null;
+    this.sequence = null;
+    this.heartbeatTimer = null;
+    this.reconnectTimer = null;
+    this.heartbeatInterval = 0;
+    this.heartbeatAck = true;
+    this.reconnectAttempts = 0;
+    this.lastError = "";
+  }
+
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/connect" && request.method === "POST") {
+      try {
+        const status = await this.connect();
+        return json({ ok: true, ...status });
+      } catch (error) {
+        this.lastError = String(error.message || error).slice(0, 180);
+        await this.ctx.storage.put("gateway_last_error", this.lastError);
+        return json({ ok: false, error: this.lastError }, 503);
+      }
+    }
+    if (path === "/status") {
+      return json({
+        ok: true,
+        state: this.socket && this.socket.readyState === WebSocket.OPEN ? "connected" :
+          this.socket && this.socket.readyState === WebSocket.CONNECTING ? "connecting" : "disconnected",
+        session: Boolean(await this.ctx.storage.get("gateway_session_id")),
+        lastEventAt: await this.ctx.storage.get("gateway_last_event_at") || null,
+        lastError: await this.ctx.storage.get("gateway_last_error") || this.lastError || null
+      });
+    }
+    return json({ error: "Not found" }, 404);
+  }
+
+  async connect() {
+    if (!this.env.DISCORD_TOKEN || !this.env.GUILD_ID || !this.env.BOT_USER_ID) {
+      throw new Error("DISCORD_TOKEN, GUILD_ID, and BOT_USER_ID must be configured.");
+    }
+    if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
+      return { state: this.socket.readyState === WebSocket.OPEN ? "connected" : "connecting" };
+    }
+
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    const sessionId = await this.ctx.storage.get("gateway_session_id");
+    const resumeUrl = await this.ctx.storage.get("gateway_resume_url");
+    this.sequence = await this.ctx.storage.get("gateway_sequence") ?? null;
+    const endpoint = new URL(resumeUrl || "wss://gateway.discord.gg/");
+    endpoint.searchParams.set("v", "10");
+    endpoint.searchParams.set("encoding", "json");
+    const ws = new WebSocket(endpoint.toString());
+    this.socket = ws;
+    this.heartbeatAck = true;
+    this.heartbeatInterval = 0;
+
+    ws.addEventListener("open", () => {
+      console.log("Discord Gateway WebSocket opened.");
+    });
+    ws.addEventListener("message", event => {
+      this.ctx.waitUntil(this.onGatewayMessage(ws, event.data).catch(error => {
+        this.lastError = String(error.message || error).slice(0, 180);
+        console.log("Discord Gateway message error: " + this.lastError);
+        return this.ctx.storage.put("gateway_last_error", this.lastError);
+      }));
+    });
+    ws.addEventListener("close", event => {
+      if (this.socket !== ws) return;
+      this.socket = null;
+      this.clearHeartbeat();
+      this.lastError = "WebSocket closed (" + event.code + ")";
+      this.ctx.waitUntil(this.ctx.storage.put("gateway_last_error", this.lastError));
+      this.scheduleReconnect();
+    });
+    ws.addEventListener("error", () => {
+      this.lastError = "Discord Gateway WebSocket error.";
+      this.ctx.waitUntil(this.ctx.storage.put("gateway_last_error", this.lastError));
+      try { ws.close(4000, "gateway socket error"); } catch {}
+      this.scheduleReconnect();
+    });
+    return { state: "connecting" };
+  }
+
+  clearHeartbeat() {
+    if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  scheduleReconnect(delayMs = null) {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    const delay = delayMs === null
+      ? Math.min(60000, 1000 * (2 ** Math.min(this.reconnectAttempts++, 6))) + Math.floor(Math.random() * 800)
+      : delayMs;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.ctx.waitUntil(this.connect().catch(async error => {
+        this.lastError = String(error.message || error).slice(0, 180);
+        await this.ctx.storage.put("gateway_last_error", this.lastError);
+        this.scheduleReconnect();
+      }));
+    }, delay);
+  }
+
+  sendHeartbeat(ws) {
+    if (this.socket !== ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!this.heartbeatAck) {
+      this.lastError = "Heartbeat ACK was missed; reconnecting.";
+      try { ws.close(4000, "heartbeat ACK missed"); } catch {}
+      this.scheduleReconnect(1000);
+      return;
+    }
+    this.heartbeatAck = false;
+    try {
+      ws.send(JSON.stringify({ op: 1, d: this.sequence }));
+    } catch {
+      try { ws.close(4000, "heartbeat send failed"); } catch {}
+      this.scheduleReconnect(1000);
+    }
+  }
+
+  startHeartbeat(ws, interval) {
+    this.clearHeartbeat();
+    this.heartbeatInterval = interval;
+    const tick = () => {
+      if (this.socket !== ws || ws.readyState !== WebSocket.OPEN) return;
+      this.sendHeartbeat(ws);
+      this.heartbeatTimer = setTimeout(tick, this.heartbeatInterval);
+    };
+    this.heartbeatTimer = setTimeout(tick, Math.floor(Math.random() * interval));
+  }
+
+  sendIdentifyOrResume(ws) {
+    const sequence = this.sequence;
+    this.ctx.waitUntil(Promise.all([
+      this.ctx.storage.get("gateway_session_id"),
+      this.ctx.storage.get("gateway_resume_url")
+    ]).then(([savedSession, savedUrl]) => {
+      if (this.socket !== ws || ws.readyState !== WebSocket.OPEN) return;
+      if (savedSession && savedUrl && sequence !== null && sequence !== undefined) {
+        ws.send(JSON.stringify({
+          op: 6,
+          d: { token: this.env.DISCORD_TOKEN, session_id: savedSession, seq: sequence }
+        }));
+      } else {
+        ws.send(JSON.stringify({
+          op: 2,
+          d: {
+            token: this.env.DISCORD_TOKEN,
+            intents: 33281,
+            properties: { os: "linux", browser: "convx-discord-assistant", device: "convx-discord-assistant" }
+          }
+        }));
+      }
+    }).catch(error => {
+      this.lastError = String(error.message || error).slice(0, 180);
+      try { ws.close(4000, "identify/resume failed"); } catch {}
+      this.scheduleReconnect(1000);
+    }));
+  }
+
+  async onGatewayMessage(ws, data) {
+    if (this.socket !== ws) return;
+    let packet;
+    try { packet = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data)); }
+    catch { return; }
+
+    if (packet.op === 10) {
+      const interval = Number(packet.d?.heartbeat_interval);
+      if (!Number.isFinite(interval) || interval < 1000) throw new Error("Discord supplied an invalid heartbeat interval.");
+      this.startHeartbeat(ws, interval);
+      this.sendIdentifyOrResume(ws);
+      return;
+    }
+    if (packet.op === 11) {
+      this.heartbeatAck = true;
+      return;
+    }
+    if (packet.op === 1) {
+      try { ws.send(JSON.stringify({ op: 1, d: this.sequence })); }
+      catch { try { ws.close(4000, "server heartbeat request failed"); } catch {} }
+      return;
+    }
+    if (packet.op === 7) {
+      try { ws.close(4000, "Discord requested reconnect"); } catch {}
+      this.scheduleReconnect(1000);
+      return;
+    }
+    if (packet.op === 9) {
+      if (!packet.d) {
+        await this.ctx.storage.delete(["gateway_session_id", "gateway_resume_url", "gateway_sequence"]);
+        this.sequence = null;
+      }
+      try { ws.close(4000, "invalid session"); } catch {}
+      this.scheduleReconnect(1000 + Math.floor(Math.random() * 4000));
+      return;
+    }
+    if (packet.op !== 0 || !packet.t) return;
+
+    this.sequence = packet.s ?? this.sequence;
+    if (this.sequence !== null && this.sequence !== undefined) {
+      await this.ctx.storage.put("gateway_sequence", this.sequence);
+    }
+    await this.ctx.storage.put("gateway_last_event_at", Date.now());
+
+    if (packet.t === "READY") {
+      this.reconnectAttempts = 0;
+      await this.ctx.storage.put({
+        gateway_session_id: packet.d.session_id,
+        gateway_resume_url: packet.d.resume_gateway_url,
+        gateway_last_error: ""
+      });
+      this.lastError = "";
+      console.log("Discord Gateway READY; event-driven message handling is active.");
+      return;
+    }
+    if (packet.t === "RESUMED") {
+      this.reconnectAttempts = 0;
+      await this.ctx.storage.put("gateway_last_error", "");
+      this.lastError = "";
+      console.log("Discord Gateway session resumed.");
+      return;
+    }
+    if (packet.t === "MESSAGE_CREATE") {
+      const message = packet.d;
+      this.ctx.waitUntil(this.processMessage(message).catch(async error => {
+        const detail = String(error.message || error).slice(0, 160);
+        console.log("Gateway message handler failed: " + detail);
+        try {
+          await postAdminAlert(this.env, this.env.DB, "gateway-handler-failure",
+            "A real-time message handler failed; the Gateway will continue. " + detail);
+        } catch {}
+      }));
+    }
+  }
+
+  async processMessage(message) {
+    if (!message || message.guild_id !== String(this.env.GUILD_ID || "") || message.author?.bot) return;
+    await saveMessage(this.env, this.env.DB, message);
+    if (!isBotMention(this.env, message)) return;
+    const claimed = await claimMentionOnce(this.env.DB, message);
+    if (!claimed) return;
+    await handleMention(this.env, message);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -1100,8 +1362,17 @@ export default {
       });
     }
     if (url.pathname === "/health") {
+      let gatewayStatus = null;
+      try {
+        const gatewayId = env.DISCORD_GATEWAY.idFromName("convx-discord-gateway");
+        const gatewayResponse = await env.DISCORD_GATEWAY.get(gatewayId).fetch("https://gateway/status");
+        gatewayStatus = await gatewayResponse.json();
+      } catch (error) {
+        gatewayStatus = { state: "unavailable", error: String(error.message || error).slice(0, 120) };
+      }
       return json({
         ok: true,
+        gateway: gatewayStatus,
         service: "convx-discord-assistant",
         configured: {
           discordToken: Boolean(env.DISCORD_TOKEN),
@@ -1118,8 +1389,8 @@ export default {
         return json({ error: "Unauthorized" }, 401);
       }
       try {
-        await pollNewMessages(env);
-        return json({ ok: true });
+        const gateway = await startGateway(env);
+        return json({ ok: true, gateway });
       } catch (error) {
         console.log("Manual run failed: " + String(error.message || error).slice(0, 180));
         return json({ ok: false, error: "Run failed; see Worker logs." }, 500);
@@ -1128,9 +1399,17 @@ export default {
     return json({ error: "Not found" }, 404);
   },
   async scheduled(controller, env, ctx) {
-    ctx.waitUntil(pollNewMessages(env).catch(async error => {
-      console.log("Scheduled run failed: " + String(error.message || error).slice(0, 180));
-      await postAdminAlert(env, env.DB, "scheduled-run-failure", "Scheduled polling failed: " + String(error.message || error).slice(0, 220));
+    // Cron is now only a supervisor/recovery hook. New Discord messages arrive through
+    // the persistent Gateway connection, not through channel polling.
+    ctx.waitUntil(startGateway(env).catch(async error => {
+      console.log("Gateway supervisor failed: " + String(error.message || error).slice(0, 180));
+      await postAdminAlert(env, env.DB, "gateway-supervisor-failure", "Real-time Gateway startup/recovery failed: " + String(error.message || error).slice(0, 200));
+    }));
+    ctx.waitUntil(backfillHistory(env).catch(error => {
+      console.log("History backfill failed: " + String(error.message || error).slice(0, 160));
+    }));
+    ctx.waitUntil(cleanupMentionClaims(env.DB).catch(error => {
+      console.log("Mention deduplication cleanup skipped: " + String(error.message || error).slice(0, 100));
     }));
   }
 };
