@@ -545,7 +545,7 @@ function safeTuningArgs(raw, current) {
   };
 }
 
-function withRuntimeSnapshot(messages, modelId, settings, hasImages, tuningEnabled) {
+function withRuntimeSnapshot(messages, modelId, settings, hasImages, tuningEnabled, ownerSelectedId) {
   const runtime = [
     "LIVE RUNTIME SNAPSHOT (authoritative for this request; use it instead of guessing):",
     "Build: " + CONVY_BUILD_VERSION,
@@ -600,12 +600,6 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
       ? "No eligible, non-down vision model from CONVY's first two preferred models is available. I did not send the image to a text-only model."
       : "All eligible community text models are currently reported down. No model was called.");
   }
-  const preferredId = await setting(db, "preferred_model_id");
-  const preferredIndex = candidates.findIndex(model =>
-    model.model_id === preferredId &&
-    (Number(model.local_success_count) || 0) > (Number(model.local_failure_count) || 0)
-  );
-  if (preferredIndex > 0 && !priority.has(preferredId)) candidates.unshift(candidates.splice(preferredIndex, 1)[0]);
 
   const query = requestText(messages);
   let attempts = 0;
@@ -622,7 +616,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
       let conversation = [...messages];
 
       const postCompletion = async (inputMessages, useTools) => {
-        const requestMessages = withRuntimeSnapshot(inputMessages, id, currentSettings, hasImages, tuningEnabled);
+        const requestMessages = withRuntimeSnapshot(inputMessages, id, currentSettings, hasImages, tuningEnabled, ownerSelectedId);
         const body = {
           model: id,
           messages: requestMessages,
@@ -693,7 +687,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
 
         // Rebuild the runtime snapshot after tuning, then force a normal answer rather than
         // allowing an endless tool loop.
-        const finalMessages = withRuntimeSnapshot(conversation, id, currentSettings, hasImages, tuningEnabled);
+        const finalMessages = withRuntimeSnapshot(conversation, id, currentSettings, hasImages, tuningEnabled, ownerSelectedId);
         response = await fetch(POLLINATIONS_API + "/v1/chat/completions", {
           method: "POST",
           headers: {
