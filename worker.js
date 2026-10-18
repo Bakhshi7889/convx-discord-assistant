@@ -267,6 +267,8 @@ function catalogTextRatesAreFree(model) {
 }
 function verifiedFreeTextModel(model) {
   if (!model || model.paidOnly === true || model.paid_only === true) return false;
+  // Agent wrappers can trigger billable child calls even when the wrapper has no text rate.
+  if (model.agent === true) return false;
   const id = String(model.id || model.name || "").trim();
   if (!(model.community === true || id.startsWith("community/"))) return false;
   if (model.category && String(model.category).toLowerCase() !== "text") return false;
@@ -295,26 +297,44 @@ function localModelSuccessRate(model) {
   const total = successes + failures;
   return total > 0 ? successes / total : null;
 }
-function modelScore(model) {
-  const rank = statusRank(model.health);
-  const healthPoints = rank === 0 ? 30 : rank === 1 ? 21 : rank === 2 ? 4 : 14;
-  const providerRate = model.success_rate == null
-    ? 15
-    : 25 * Math.max(0, Math.min(1, Number(model.success_rate) || 0));
-  const localRate = localModelSuccessRate(model);
-  const localPoints = localRate == null ? 15 : 25 * localRate;
-  const attempts = Math.max(0, Number(model.local_success_count) || 0) +
-    Math.max(0, Number(model.local_failure_count) || 0);
-  // Small Bayesian prior prevents one lucky reply from instantly crowning a model.
-  const localPointsSmoothed = attempts > 0
-    ? 25 * (((Number(model.local_success_count) || 0) + 2) / (attempts + 4))
-    : localPoints;
-  const latency = Number(model.avg_latency_ms) || 0;
-  const speedPoints = latency > 0 ? 15 * (1 - Math.min(12000, Math.max(0, latency)) / 12000) : 8;
-  const requests = Math.max(0, Number(model.request_count) || 0);
-  const confidencePoints = 5 * Math.min(1, requests / 50);
-  return Math.max(0, Math.min(100, Math.round(healthPoints + providerRate + localPointsSmoothed + speedPoints + confidencePoints)));
+function externalModelBenchmark(model) {
+  const id = String(model?.model_id || model?.id || "").toLowerCase();
+  const family = id.split("/").pop().replace(/:(?:free|stable|paid)$/i, "");
+  // Text Arena open-source leaderboard snapshot, 15 Oct 2026. These are family priors,
+  // not guarantees about an individual community host.
+  if (family === "glm-5.3-flash" || family === "glm-5.3-flash-free") {
+    return { score: 91, label: "Arena OS #6", elo: 1474, url: "https://arena.ai/leaderboard/chat/text?license=open-source" };
+  }
+  if (family === "muse-glimmer") {
+    return { score: 75, label: "Arena OS #33", elo: 1425, url: "https://arena.ai/leaderboard/chat/text?license=open-source" };
+  }
+  if (family === "gpt-oss-120b") {
+    return { score: 51, label: "Arena OS #84", elo: 1352, url: "https://arena.ai/leaderboard/chat/text?license=open-source" };
+  }
+  if (family === "nvidia-nemotron-3-super-120b-a12b") {
+    return { score: 53, label: "Arena OS #78", elo: 1360, url: "https://arena.ai/leaderboard/chat/text?license=open-source" };
+  }
+  return null;
 }
+function modelScore(model) {
+  const health = statusRank(model.health);
+  const healthPoints = health === 0 ? 20 : health === 1 ? 14 : health === 2 ? 2 : 9;
+  const providerPoints = model.success_rate == null
+    ? 10
+    : 20 * Math.max(0, Math.min(1, Number(model.success_rate) || 0));
+  const successes = Math.max(0, Number(model.local_success_count) || 0);
+  const failures = Math.max(0, Number(model.local_failure_count) || 0);
+  const attempts = successes + failures;
+  // Bayesian smoothing means one successful request is evidence, not a coronation.
+  const localRate = (successes + 2) / (attempts + 4);
+  const localPoints = 25 * localRate;
+  const benchmark = externalModelBenchmark(model);
+  const benchmarkPoints = benchmark ? 25 * benchmark.score / 100 : 12.5;
+  const latency = Number(model.avg_latency_ms) || 0;
+  const speedPoints = latency > 0 ? 10 * (1 - Math.min(12000, Math.max(0, latency)) / 12000) : 5;
+  return Math.max(0, Math.min(100, Math.round(healthPoints + providerPoints + localPoints + benchmarkPoints + speedPoints)));
+}
+
 function sortModelRows(rows) {
   return [...rows].sort((a, b) =>
     modelScore(b) - modelScore(a) ||
@@ -330,7 +350,8 @@ function sortModelRows(rows) {
 
 async function models(db, force=false) {
   const last=Number(await setting(db,"model_checked_ms")||0);
-  if(!force&&Date.now()-last<MODEL_CACHE_MS){
+  const filterVersion=await setting(db,"model_filter_version");
+  if(!force&&filterVersion==="2"&&Date.now()-last<MODEL_CACHE_MS){
     const cached=await db.prepare("SELECT model_id,source,health,success_rate,request_count,avg_latency_ms,local_success_count,local_failure_count FROM models WHERE eligible=1").all();
     return sortModelRows(cached.results||[]);
   }
@@ -346,6 +367,7 @@ async function models(db, force=false) {
   await db.prepare("UPDATE models SET eligible=0").run();
   for(const m of eligible)await db.prepare("INSERT INTO models(model_id,source,prompt_price,completion_price,health,success_rate,request_count,checked_at,eligible) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,1) ON CONFLICT(model_id) DO UPDATE SET source=excluded.source,prompt_price=excluded.prompt_price,completion_price=excluded.completion_price,health=excluded.health,success_rate=excluded.success_rate,request_count=excluded.request_count,checked_at=CURRENT_TIMESTAMP,eligible=1")
     .bind(m.id,m.source,m.input,m.output,m.status,m.success,m.requests).run();
+  await setSetting(db,"model_filter_version","2");
   await setSetting(db,"model_checked_ms",Date.now());
   const cached=await db.prepare("SELECT model_id,source,health,success_rate,request_count,avg_latency_ms,local_success_count,local_failure_count FROM models WHERE eligible=1").all();
   return sortModelRows(cached.results||[]);
