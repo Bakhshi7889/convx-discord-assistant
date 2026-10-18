@@ -4,6 +4,7 @@ const MODEL_CACHE_MS = 15 * 60 * 1000;
 const MODEL_ATTEMPT_LIMIT = 8;
 const MODEL_TIMEOUT_MS = 9000;
 const MAX_REPLY = 1850;
+const MAX_CHANNELS_PER_RUN = 20;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -247,9 +248,9 @@ async function models(db, force = false) {
   await setSetting(db, "model_checked_ms", Date.now());
   return eligible;
 }
-async function generateAnswer(env, db, query) {
+async function generateAnswer(env, db, query, channelId) {
   if (!env.POLLINATIONS_API_KEY) throw new Error("Pollinations API key is not configured yet.");
-  const context = await searchContext(db, env.TARGET_CHANNEL_ID, query);
+  const context = await searchContext(db, channelId, query);
   const cleanQuery = normalize(query);
   const direct = (context.knowledge || []).find(item => normalize(item.question) === cleanQuery);
   if (direct) {
@@ -392,7 +393,7 @@ async function handleMention(env, message) {
     return;
   }
   try {
-    const answer = await generateAnswer(env, env.DB, query);
+    const answer = await generateAnswer(env, env.DB, query, message.channel_id);
     await sendReply(env, message.channel_id, answer, message.id);
   } catch (error) {
     await sendReply(env, message.channel_id,
@@ -400,13 +401,13 @@ async function handleMention(env, message) {
       "\nPlease ask a Convx admin if this is urgent.", message.id);
   }
 }
-async function fetchChannelMessages(env, params) {
+async function fetchChannelMessages(env, channelId, params) {
   const query = new URLSearchParams({ limit: "100" });
   for (const [key, value] of Object.entries(params || {})) {
     if (value) query.set(key, value);
   }
   // discord() already prefixes /api/v10, so pass only the relative API path here.
-  return discord(env, "/channels/" + env.TARGET_CHANNEL_ID + "/messages?" + query.toString());
+  return discord(env, "/channels/" + channelId + "/messages?" + query.toString());
 }
 async function backfillHistory(env) {
   const db = env.DB;
@@ -415,7 +416,7 @@ async function backfillHistory(env) {
   for (let page = 0; page < 4; page++) {
     let batch;
     try {
-      batch = await fetchChannelMessages(env, before ? { before } : {});
+      batch = await fetchChannelMessages(env, env.TARGET_CHANNEL_ID, before ? { before } : {});
     } catch (error) {
       console.log("History backfill paused: " + String(error.message || error).slice(0, 150));
       return;
@@ -435,32 +436,110 @@ async function backfillHistory(env) {
     }
   }
 }
-async function pollNewMessages(env) {
-  if (!env.DISCORD_TOKEN || !env.TARGET_CHANNEL_ID || !env.BOT_USER_ID) return;
-  const db = env.DB;
-  let cursor = await setting(db, "last_message_id");
+async function pollOneChannel(env, db, channel) {
+  const channelId = String(channel.id);
+  const cursorKey = "last_message_id:" + channelId;
+  let cursor = await setting(db, cursorKey);
+
+  // Migrate the original single-channel cursor without losing the primary channel position.
+  if (!cursor && channelId === String(env.TARGET_CHANNEL_ID || "")) {
+    cursor = await setting(db, "last_message_id");
+    if (cursor) await setSetting(db, cursorKey, cursor);
+  }
+
+  // First sight of a channel: save recent history and start watching from its newest message.
   if (!cursor) {
-    const recent = await fetchChannelMessages(env, {});
-    if (!recent.length) return;
+    const recent = await fetchChannelMessages(env, channelId, {});
+    if (!Array.isArray(recent) || recent.length === 0) return;
     const sorted = [...recent].sort(compareSnowflakes);
     for (const message of sorted) await saveMessage(env, db, message);
     cursor = sorted[sorted.length - 1].id;
-    await setSetting(db, "last_message_id", cursor);
-    if (!(await setting(db, "history_sync_state"))) await startHistorySync(db);
+    await setSetting(db, cursorKey, cursor);
+    if (channelId === String(env.TARGET_CHANNEL_ID || "") &&
+        !(await setting(db, "history_sync_state"))) {
+      await startHistorySync(db);
+    }
+    return;
+  }
+
+  for (let page = 0; page < 2; page++) {
+    const batch = await fetchChannelMessages(env, channelId, { after: cursor });
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    const sorted = [...batch].sort(compareSnowflakes);
+    for (const message of sorted) {
+      await saveMessage(env, db, message);
+      await handleMention(env, message);
+      cursor = message.id;
+      await setSetting(db, cursorKey, cursor);
+    }
+    if (batch.length < 100) break;
+  }
+}
+
+async function pollNewMessages(env) {
+  if (!env.DISCORD_TOKEN || !env.GUILD_ID || !env.BOT_USER_ID) return;
+  const db = env.DB;
+
+  // List accessible guild channel definitions. Actual per-channel access is checked while polling.
+  const guildChannels = await discord(env, "/guilds/" + env.GUILD_ID + "/channels");
+  if (!Array.isArray(guildChannels)) throw new Error("Discord returned an invalid guild channel list.");
+
+  let activeThreads = [];
+  try {
+    const threadData = await discord(env, "/guilds/" + env.GUILD_ID + "/threads/active");
+    activeThreads = Array.isArray(threadData?.threads) ? threadData.threads : [];
+  } catch (error) {
+    console.log("Active thread discovery skipped: " + String(error.message || error).slice(0, 120));
+  }
+
+  const byId = new Map();
+  for (const channel of guildChannels) {
+    if ([0, 2, 5, 13].includes(Number(channel.type))) byId.set(String(channel.id), channel);
+  }
+  // Active public, private, and announcement threads are channels too.
+  for (const thread of activeThreads) {
+    if ([10, 11, 12].includes(Number(thread.type))) byId.set(String(thread.id), thread);
+  }
+
+  const channels = [...byId.values()].sort((a, b) =>
+    Number(a.position || 0) - Number(b.position || 0) ||
+    String(a.id).localeCompare(String(b.id))
+  );
+  if (!channels.length) {
+    await backfillHistory(env);
+    return;
+  }
+
+  // Always check the configured primary channel, then rotate through up to 19 other channels per run.
+  const primaryId = String(env.TARGET_CHANNEL_ID || "");
+  const primary = byId.get(primaryId);
+  const others = channels.filter(channel => String(channel.id) !== primaryId);
+  const offset = others.length
+    ? (Number(await setting(db, "poll_channel_offset") || 0) % others.length)
+    : 0;
+  const selected = [];
+  if (primary) selected.push(primary);
+  const capacity = Math.max(0, MAX_CHANNELS_PER_RUN - selected.length);
+  for (let i = 0; i < Math.min(capacity, others.length); i++) {
+    selected.push(others[(offset + i) % others.length]);
+  }
+  if (others.length > capacity && capacity > 0) {
+    await setSetting(db, "poll_channel_offset", (offset + capacity) % others.length);
   } else {
-    for (let page = 0; page < 4; page++) {
-      const batch = await fetchChannelMessages(env, { after: cursor });
-      if (!Array.isArray(batch) || batch.length === 0) break;
-      const sorted = [...batch].sort(compareSnowflakes);
-      for (const message of sorted) {
-        await saveMessage(env, db, message);
-        await handleMention(env, message);
-        cursor = message.id;
-        await setSetting(db, "last_message_id", cursor);
-      }
-      if (batch.length < 100) break;
+    await setSetting(db, "poll_channel_offset", 0);
+  }
+
+  for (const channel of selected) {
+    try {
+      await pollOneChannel(env, db, channel);
+    } catch (error) {
+      // One inaccessible private channel must not block every other channel.
+      console.log("Channel poll skipped (" + String(channel.id) + "): " +
+        String(error.message || error).slice(0, 150));
     }
   }
+
+  // Full historical backfill remains focused on the configured primary channel.
   await backfillHistory(env);
 }
 export default {
