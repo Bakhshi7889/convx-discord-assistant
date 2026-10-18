@@ -1,12 +1,12 @@
 # Convx Discord Assistant
 
-A Cloudflare Worker + D1 Discord assistant for Convx. It polls up to 20 accessible guild channels per minute, archives messages with per-channel cursors, and replies to mentions. It answers from admin-approved knowledge first and uses Pollinations text models only when text input and output prices are explicitly zero. CONVY uses she/her and a concise, dryly funny code-reviewer voice without theatrical roast monologues or model-ID signatures. Every direct reply pings only the user being answered; a roast can also ping the explicitly targeted member. Role mentions are disabled in replies and failure alerts. Explicit member roast commands use short deterministic jokes rather than an LLM-generated roast, avoiding fabricated details and gibberish. Serious questions remain accurate and careful.
+A Cloudflare Worker + D1 Discord assistant for Convx. It polls up to 20 accessible guild channels per minute, archives messages with per-channel cursors, and replies to mentions. It answers from admin-approved knowledge first and uses Pollinations text models only when text input and output prices are explicitly zero. CONVY uses she/her and a concise, dryly funny code-reviewer voice without theatrical roast monologues or model-ID signatures. She reads the original message when a user replies to it and mentions CONVY, then answers in the same text channel or active thread. Forum/media posts are handled as threads; their parent forum channels are not direct message destinations. Every direct reply pings only the user being answered; a roast can also ping the explicitly targeted member. Role mentions are disabled in replies and failure alerts. Explicit member roast commands use short deterministic jokes rather than an LLM-generated roast, avoiding fabricated details and gibberish. Serious questions remain accurate and careful.
 
 ## Discord setup
 
 1. Open https://discord.com/developers/applications and create an application.
 2. Open **Bot**, create the bot, enable **Message Content Intent**, and copy its token privately.
-3. Under **OAuth2 → URL Generator**, select `bot` and `applications.commands`. Grant View Channel, Read Message History, Send Messages and Send Messages in Threads, then invite it to Convx.
+3. Under **OAuth2 → URL Generator**, select `bot` and `applications.commands`. Grant View Channel and Read Message History for channels it should monitor, Send Messages in ordinary text/announcement channels, and Send Messages in Threads for thread replies, including forum/media posts, then invite it to Convx.
 4. Copy the Application ID (bot user ID), target channel ID, server ID, and admin role IDs. Enable Developer Mode in Discord settings to copy IDs.
 
 ## Pollinations setup
@@ -52,7 +52,7 @@ Admins are identified by configured user IDs and/or configured admin roles. Neve
 
 ## Data and privacy
 
-Messages from accessible channels and active threads within the configured guild are stored in D1, including author identifiers/names, timestamps, message URLs, approved knowledge entries, and model health/latency statistics. A new channel's initial snapshot stores the latest 100 messages; conversational saving uses the most recent 30 indexed messages from the current channel. Relevant excerpts are sent to the selected third-party model. The question and limited relevant excerpts are sent to the selected third-party model. Tell server members this channel is indexed. Do not store secrets or sensitive personal conversations.
+Messages from accessible text/announcement channels and active public/private/announcement threads (including forum/media posts) within the configured guild are stored in D1, including author identifiers/names, timestamps, message URLs, approved knowledge entries, and model health/latency statistics. When a user replies to an older message and mentions CONVY, the bot reads the referenced message through Discord's message reference or fetches it directly if needed. Referenced content is treated as untrusted context, not instructions. Newly discovered threads are seeded with recent history; fresh bot mentions in the last 15 minutes are handled once during initial seeding. A new channel's initial snapshot stores the latest 100 messages; conversational saving uses the most recent 30 indexed messages from the current channel. Relevant excerpts are sent to the selected third-party model. The question and limited relevant excerpts are sent to the selected third-party model. Tell server members this channel is indexed. Do not store secrets or sensitive personal conversations.
 
 ## Local checks
 
