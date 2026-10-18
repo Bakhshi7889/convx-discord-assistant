@@ -4,25 +4,26 @@ const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
 // Lazy-refresh the shared Pollinations catalog hourly in Durable Object storage, never D1.
 const MODEL_CACHE_MS = 60 * 60 * 1000;
-const MODEL_CATALOG_SCHEMA_VERSION = 3;
+const MODEL_CATALOG_SCHEMA_VERSION = 4;
 const MODEL_ATTEMPT_LIMIT = 3;
 const MODEL_TIMEOUT_MS = 9000;
 // Explicit first-choice order. Models still must appear in the live catalog as eligible,
 // free community text models before they can be called.
 const PREFERRED_MODEL_ORDER = [
-  "community/morriszdweck/glm-5.3-flash-free",
   "community/YoannDev90/muse-glimmer-30b:free",
+  "community/morriszdweck/glm-5.3-flash-free",
   "community/pegalink/jimmy"
 ];
 const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r18";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r19";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Integrate concise teammate-style replies: answer first, skip filler, and use lightweight Discord-friendly Markdown.",
-  "Use inline code for commands and model IDs; wrap URLs in Discord angle brackets when suppressing link previews is useful.",
-  "Reinforce focused clarification and honest tool-use claims without replacing existing persona, context, or safety instructions."
+  "Set community/YoannDev90/muse-glimmer-30b:free as CONVY's first-choice text model, followed by GLM-5.3-Flash-Free and Jimmy.",
+  "Fix free community model discovery to accept Pollinations reliable-catalog entries whose health is unknown because no observations exist, while rejecting explicitly unhealthy models.",
+  "Fall back from /models to /text/models when the first catalog contains no eligible models; keep requiring explicitly zero input and output text-token prices.",
+  "Bump the cached model-catalog schema so stale eligibility data is not reused after the filter fix."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -580,9 +581,11 @@ async function searchContext(db, channelId, query, excludeMessageId = "", botUse
 }
 function statusRank(status) {
   const s = String(status || "").toLowerCase();
-  if (s.includes("green") || s.includes("healthy") || s === "online" || s === "good") return 0;
+  // Check negative states first: "unhealthy" also contains "healthy".
+  if (s.includes("red") || s.includes("unhealthy") || s === "offline" || s === "down" ||
+      s.includes("disabled") || s.includes("unavailable") || s === "failed") return 2;
   if (s.includes("yellow") || s.includes("degraded") || s.includes("warning") || s === "slow") return 1;
-  if (s.includes("red") || s.includes("unhealthy") || s === "offline" || s === "down") return 2;
+  if (s.includes("green") || s.includes("healthy") || s === "online" || s === "good") return 0;
   return 3;
 }
 function statusEmoji(status) {
@@ -694,19 +697,25 @@ function catalogTextRatesAreFree(model) {
   return sawAnyPrice && sawInputPrice && sawOutputPrice;
 }
 function verifiedFreeTextModel(model) {
-  if (!model || model.paidOnly === true || model.paid_only === true) return false;
-  if (String(model.health?.status || "").toLowerCase() !== "healthy") return false;
+  if (!model) return false;
+  const isTrue = value => value === true || String(value).toLowerCase() === "true";
+  if (isTrue(model.paidOnly) || isTrue(model.paid_only)) return false;
+  // /models?reliability=reliable intentionally includes models without observations.
+  // Accept unknown/missing health, but never explicitly route to a known-down model.
+  const health = modelHealth(model).status;
+  if (statusRank(health) === 2) return false;
   // Agent wrappers can trigger billable child calls even when the wrapper has no text rate.
-  if (model.agent === true) return false;
+  if (isTrue(model.agent)) return false;
   const id = String(model.id || model.name || "").trim();
   const source = String(model.source || "").toLowerCase();
-  if (!(model.community === true || source === "community" || id.startsWith("community/"))) return false;
+  if (!(isTrue(model.community) || source === "community" || id.startsWith("community/"))) return false;
   if (model.category && String(model.category).toLowerCase() !== "text") return false;
   if (Array.isArray(model.output_modalities) &&
       !model.output_modalities.some(value => String(value).toLowerCase() === "text")) return false;
   const endpoints = model.supported_endpoints || model.supportedEndpoints;
   if (Array.isArray(endpoints) && endpoints.length &&
       !endpoints.some(value => String(value).includes("/v1/chat/completions"))) return false;
+  // Fail closed on missing, malformed, or non-zero input/output text-token prices.
   return catalogTextRatesAreFree(model);
 }
 
@@ -716,10 +725,16 @@ function catalogModels(payload) {
   return [];
 }
 function modelHealth(model) {
-  const h=model.health&&typeof model.health==="object"?model.health:{};
-  let success=Number(h.success_rate??h.successRate??h.success_rate_percent);
-  if(!Number.isFinite(success))success=null;else if(success>1)success/=100;
-  return {status:String(h.status||model.status||"unknown"),success:success===null?null:Math.max(0,Math.min(1,success)),requests:Number(h.requests??h.request_count??h.requestCount??0)||0};
+  const raw = model?.health;
+  const h = raw && typeof raw === "object" ? raw : {};
+  let success = Number(h.success_rate ?? h.successRate ?? h.success_rate_percent);
+  if (!Number.isFinite(success)) success = null;
+  else if (success > 1) success /= 100;
+  return {
+    status: String(h.status || (typeof raw === "string" ? raw : "") || model?.status || "unknown"),
+    success: success === null ? null : Math.max(0, Math.min(1, success)),
+    requests: Number(h.requests ?? h.request_count ?? h.requestCount ?? 0) || 0
+  };
 }
 function localModelSuccessRate(model) {
   const successes = Math.max(0, Number(model.local_success_count) || 0);
@@ -820,38 +835,68 @@ async function models(env, force = false) {
   }
 
   try {
-    const response = await fetch(POLLINATIONS_API + "/models?source=community&reliability=reliable", {
-      headers: { "accept": "application/json" },
-      signal: AbortSignal.timeout(10000)
-    });
-    if (!response.ok) throw new Error("Pollinations model catalog returned HTTP " + response.status);
-
-    const all = catalogModels(await response.json());
-    const eligible = [];
     const previousById = new Map(previousModels.map(model => [String(model.model_id || model.id || ""), model]));
-    for (const model of all) {
-      if (!verifiedFreeTextModel(model)) continue;
-      const id = String(model.id || model.name || "").trim();
-      if (!id) continue;
-      const h = modelHealth(model);
-      const p = modelPrices(model);
-      const prior = previousById.get(id) || {};
-      eligible.push({
-        model_id: id,
-        source: String(model.source || "community").toLowerCase(),
-        health: h.status,
-        success_rate: h.success,
-        request_count: h.requests,
-        prompt_price: p.input ?? 0,
-        completion_price: p.output ?? 0,
-        avg_latency_ms: Number(prior.avg_latency_ms) || 0,
-        local_success_count: Number(prior.local_success_count) || 0,
-        local_failure_count: Number(prior.local_failure_count) || 0
-      });
+    const catalogEndpoints = [
+      "/models?source=community&reliability=reliable",
+      "/text/models?source=community&reliability=reliable"
+    ];
+    let eligible = [];
+    let selectedEndpoint = "";
+    let lastCatalogIssue = "";
+
+    // /models is the primary documented catalog. /text/models is a targeted fallback
+    // for API versions or responses where the mixed catalog cannot be filtered safely.
+    for (const endpoint of catalogEndpoints) {
+      try {
+        const response = await fetch(POLLINATIONS_API + endpoint, {
+          headers: { "accept": "application/json" },
+          signal: AbortSignal.timeout(10000)
+        });
+        if (!response.ok) {
+          lastCatalogIssue = endpoint.split("?")[0] + " returned HTTP " + response.status;
+          continue;
+        }
+
+        const all = catalogModels(await response.json());
+        const currentEligible = [];
+        for (const model of all) {
+          if (!verifiedFreeTextModel(model)) continue;
+          const id = String(model.id || model.name || "").trim();
+          if (!id) continue;
+          const h = modelHealth(model);
+          const p = modelPrices(model);
+          const prior = previousById.get(id) || {};
+          currentEligible.push({
+            model_id: id,
+            source: String(model.source || "community").toLowerCase(),
+            health: h.status,
+            success_rate: h.success,
+            request_count: h.requests,
+            prompt_price: p.input,
+            completion_price: p.output,
+            avg_latency_ms: Number(prior.avg_latency_ms) || 0,
+            local_success_count: Number(prior.local_success_count) || 0,
+            local_failure_count: Number(prior.local_failure_count) || 0
+          });
+        }
+
+        if (currentEligible.length) {
+          eligible = currentEligible;
+          selectedEndpoint = endpoint.split("?")[0];
+          break;
+        }
+        lastCatalogIssue = endpoint.split("?")[0] + " returned " + all.length +
+          " entries, but none passed the free community text-model and zero-price checks";
+      } catch (catalogError) {
+        lastCatalogIssue = endpoint.split("?")[0] + " failed: " +
+          String(catalogError.message || catalogError).slice(0, 100);
+      }
     }
 
     if (!eligible.length) {
-      throw new Error("Pollinations returned no models that pass the strict free community text-model filter.");
+      throw new Error("No verified free community text models found in /models or /text/models. " +
+        (lastCatalogIssue || "Input/output text-token pricing could not be verified.") +
+        ". No paid model was attempted.");
     }
 
     const snapshot = {
@@ -880,7 +925,7 @@ async function models(env, force = false) {
       stale: false,
       cacheSaved,
       lastSuccessfulModel,
-      source: "live Pollinations community catalog"
+      source: "live Pollinations catalog (" + selectedEndpoint + ")"
     };
   } catch (error) {
     if (previousModels.length) {
