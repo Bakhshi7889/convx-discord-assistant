@@ -62,12 +62,15 @@ The verified creator is Discord user ID `856033880405573632`.
 | `!temperature 0-1` / `!temperature auto` | Set persistent sampling temperature or automatic settings. |
 | `!maxtokens 100-900` / `!maxtokens auto` | Set persistent output-token budget or automatic settings. |
 | `!web on` / `!web off` | Enable or disable web search. Search is on by default. |
-| `!search query` | Explicitly search the web and answer with returned source links when available. |
+| `!search query` | Search the web and answer with returned source links when available. |
+| `!images query` | Show up to three image previews with links to the original source pages. DuckDuckGo is attempted first, with Wikimedia Commons as a fallback. |
+| `!version` | Show current build version, Git commit, source commit time, deployment timestamp, and deployment workflow link. |
+| `!changes` | Show release notes for the current version and the previous recorded release. |
 | `!inspect @member` | Inspect Discord-visible profile metadata and avatar/banner. A bio is shown only if the API actually provides one to the bot. |
 | `!remember fact` | Save an owner-approved long-term memory. |
 | `!memory` / `!forget ID` | List or remove an owner memory. |
 | `!context` | Show the latest rolling channel context that CONVY can use. |
-| `!runtime` | Show build, last successful model, routing order, and release notes. |
+| `!runtime` | Show deployment-stamped build metadata, last successful model, routing order, and release notes. |
 
 ### Configured admin commands
 
@@ -85,7 +88,7 @@ Selecting models, changing persistent inference settings, pausing the assistant,
 
 Profile inspection reports only metadata actually returned by Discord, including username/display name, account creation time, server join time, roles, avatar, and banner when available. The regular bot API may not include Discord's profile bio, so CONVY must not make one up. Avatar/banner images may be sent to the selected vision-capable model for description. CONVY should describe visible content without guessing someone's identity or sensitive traits from a picture.
 
-Web search uses DuckDuckGo results and a limited fallback for instant answers. Use `!search query` for an explicit lookup, or ask a clearly current/latest/online question. Search availability and returned results vary; a failed or empty search is reported as such instead of being presented as fact.
+Web search uses DuckDuckGo HTML results with a limited instant-answer fallback. Image search attempts DuckDuckGo's unauthenticated image endpoint and falls back to Wikimedia Commons; the DuckDuckGo image endpoint is unofficial and may change. Results can be incomplete or rate-limited. Image previews link to the original host/page rather than rehosting the files, and Commons attribution/license metadata is shown when available. A failed or empty search is reported instead of being presented as fact. The Google Custom Search JSON API is closed to new customers and scheduled to end on 1 January 2027, so this bot does not depend on it or scrape Google Search pages.
 
 ## Privacy and limits
 
@@ -98,6 +101,6 @@ Cloudflare free quotas and model/provider availability can change. D1's free-tie
 Each push to `main` runs:
 1. `node --check worker.js`
 2. Wrangler configuration/bundle dry-run validation, including Durable Object migration validation
-3. Deployment to the connected Cloudflare account
+3. Deployment to the connected Cloudflare account, with `BUILD_VERSION`, `BUILD_COMMIT`, `BUILD_COMMIT_AT`, `BUILD_APPLIED_AT`, and the GitHub Actions run URL injected into Worker variables. `BUILD_APPLIED_AT` is recorded immediately before the deployment command; it is the deployment start timestamp, not an exact completion timestamp.
 
 Do not put Discord tokens, Pollinations keys, or Cloudflare API tokens in the repository. GitHub Actions uses repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` for deployment.
