@@ -1,6 +1,6 @@
 # Convx Discord Assistant
 
-A small Cloudflare Worker + D1 Discord assistant for the Convx server. It polls one configured channel every minute, archives its messages, replies when mentioned, answers from admin-approved knowledge first, and falls back across verified-zero-price Pollinations community text models.
+A Cloudflare Worker + D1 Discord assistant for Convx. It polls up to 20 accessible guild channels per minute, archives messages with per-channel cursors, and replies to mentions. It answers from admin-approved knowledge first and uses Pollinations text models only when input and output prices are explicitly zero.
 
 ## Discord setup
 
@@ -11,7 +11,7 @@ A small Cloudflare Worker + D1 Discord assistant for the Convx server. It polls 
 
 ## Pollinations setup
 
-Create a server-side secret key at https://enter.pollinations.ai/keys. Store it only as a Cloudflare Worker secret. The worker refreshes the public community text-model catalog, checks that both input and output text prices are explicitly zero, ranks green before yellow before red, and tries candidates sequentially. Unknown prices are excluded. It must never intentionally select a paid model.
+Create a server-side secret key at https://enter.pollinations.ai/keys. Store it only as a Cloudflare Worker secret. The worker refreshes the public text-model catalog hourly, recognizes Pollinations' `promptTextPrice` and `completionTextPrice` fields, excludes models that are paid-only or have unknown/non-zero text prices, then ranks health and observed response latency. It records local success and latency statistics. A payment-required response stops fallback immediately; it must never intentionally use a paid model.
 
 ## Cloudflare
 
@@ -27,8 +27,11 @@ The deployed Worker is `convx-discord-assistant`. Set these Worker secrets/varia
 - Variable: `GUILD_ID`
 - Variable: `ADMIN_ROLE_IDS` (comma-separated role IDs)
 - Variable: `ADMIN_USER_IDS` (comma-separated Discord user IDs; optional)
+- Optional variable: `ALERT_USER_IDS` (additional user IDs to ping on failures)
+- Optional variable: `ALERT_ROLE_IDS` (additional role IDs to ping on failures)
+- Optional variable: `ALERT_CHANNEL_ID` (channel where background-failure alerts should be posted; defaults to `TARGET_CHANNEL_ID`)
 
-Cron runs once per minute, so mention replies are not instantaneous. This design avoids a permanently-running Gateway process, with the tradeoff of periodic polling. Cloudflare and Pollinations free quotas/availability can change; never promise unlimited use.
+Cron runs once per minute. The primary channel is checked every run and up to 19 other channels are rotated through each run, so reaction time in a larger server can be longer. Inaccessible private channels are skipped and do not block polling elsewhere. Cloudflare and Pollinations free quotas/availability can change; never promise unlimited use.
 
 ## Admin commands
 
@@ -40,12 +43,15 @@ Mention the bot in the configured channel:
 - `@Convx Assistant !sync` (start/restart history backfill)
 - `@Convx Assistant !models`
 - `@Convx Assistant !help`
+- `@Convx Assistant save this` (admin-only: turns the latest 30 indexed messages in the current channel into one approved Q&A, with tags)
+
+Admin failure pings use configured admin/alert user and role IDs, and are rate-limited per error type. Mention parsing stays disabled except for those explicit configured IDs.
 
 Admins are identified by configured user IDs and/or configured admin roles. Never rely on admin status supplied in message text.
 
 ## Data and privacy
 
-Only the configured channel is archived. Messages, author identifiers/names, timestamps, URLs, approved knowledge entries, and model status are stored in D1. The question and limited relevant excerpts are sent to the selected third-party model. Tell server members this channel is indexed. Do not store secrets or sensitive personal conversations.
+Messages from accessible channels and active threads within the configured guild are stored in D1, including author identifiers/names, timestamps, message URLs, approved knowledge entries, and model health/latency statistics. A new channel's initial snapshot stores the latest 100 messages; conversational saving uses the most recent 30 indexed messages from the current channel. Relevant excerpts are sent to the selected third-party model. The question and limited relevant excerpts are sent to the selected third-party model. Tell server members this channel is indexed. Do not store secrets or sensitive personal conversations.
 
 ## Local checks
 
@@ -55,7 +61,7 @@ Node.js is sufficient to syntax-check `worker.js`:
 node --check worker.js
 ```
 
-The implementation has not been end-to-end tested using your live Discord and Pollinations credentials. Test it in a private Discord channel before relying on it for onboarding.
+Syntax checks pass, but end-to-end live-model replies and conversational saving still need a Discord test after installation and channel permissions are correct.
 
 
 ## GitHub Actions
