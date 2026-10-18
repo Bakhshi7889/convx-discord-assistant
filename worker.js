@@ -548,7 +548,7 @@ function buildMemberRoast(query, message, env) {
     if (!tail || generic || /<@!?\d+>/.test(text)) {
       return {
         handled: true,
-        content: "Tag the actual target, like @CONVY roast @Akspro. I do one-line roasts, not an incident report about someone's imaginary GPU opinions."
+        content: "Tag a member like @CONVY roast @Akspro. I need an actual target, not a vague assignment."
       };
     }
     name = tail;
@@ -581,7 +581,7 @@ function buildMemberRoast(query, message, env) {
   for (const char of (id || name).toLowerCase()) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
   return {
     handled: true,
-    content: "**" + name + "** " + roasts[hash % roasts.length] + " That's the roast. No fabricated biography, no GPU-themed novella."
+    content: "**" + name + "** " + roasts[hash % roasts.length]
   };
 }
 async function handleMention(env, message) {
