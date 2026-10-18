@@ -48,7 +48,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BUILD_VERSION="$(sed -n 's/^const CONVY_BUILD_VERSION = "\\([^"]*\\)";$/\\1/p' worker.js)"
+          BUILD_VERSION="$(sed -n 's/^const CONVY_BUILD_VERSION = "\([^"]*\)";$/\1/p' worker.js)"
           test -n "$BUILD_VERSION"
           BUILD_COMMIT="$GITHUB_SHA"
           BUILD_COMMIT_AT="$(git show -s --format=%cI "$GITHUB_SHA")"
