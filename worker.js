@@ -17,15 +17,16 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r6";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r7";
 const CONVY_RELEASE_NOTES = [
   "Pinned the requested free-model order: GLM-5.3-Flash-Free, Muse-Glimmer-30B:free, then Jimmy when the live catalog confirms it is eligible.",
   "Added multimodal input for Discord images and a recent-image lookup for follow-up questions.",
   "Prevented image questions from silently falling back to a text-only model.",
   "Added live model identity and request settings to the model's context.",
   "Added a bounded response-settings tool for per-reply reasoning effort, temperature, and output-token budget.",
-  "Compact !models now shows the three requested models plus other green models only.",
-  "Added owner-only !model 1, !model 2, !model 3, and !model auto switching commands.",
+  "Compact !models numbers up to 12 additional green models for creator selection with !model 4 through !model 15.",
+  "Added owner-only !model 1 through !model 15 and !model auto switching commands.",
+  "Clarified image inputs and honest handling of unsupported audio/video attachments.",
   "Simplified model status lines and capped extra green alternatives for readability.",
   "Clarified that catalog health is not a live availability test and allow the creator to select a catalog-flagged model for a real request attempt."
 ];
@@ -411,6 +412,13 @@ function sortModelRows(rows) {
     (b.request_count ?? 0) - (a.request_count ?? 0) ||
     String(a.model_id).localeCompare(String(b.model_id))
   );
+}
+
+function extraGreenModels(pool) {
+  const preferred = new Set(PREFERRED_MODEL_ORDER);
+  return (pool || [])
+    .filter(model => !preferred.has(String(model.model_id || model.id || "")) && statusRank(model.health) === 0)
+    .sort((a, b) => modelScore(b) - modelScore(a));
 }
 
 async function models(db, force=false) {
@@ -924,9 +932,10 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null) {
     "STYLE: Answer the newest message directly, in context. Be concise by default, usually 1-3 sentences. Use contractions and casual language where natural. A normal @mention is the user talking to you, not a request to explain their own message. For simple check-ins like 'you up?' or 'are you awake?', answer naturally and briefly. Do not narrate the user's intent, parrot their words back, or ask for context that was not needed. Ask one focused clarification only when genuinely necessary. Avoid repeating stock greetings.",
     "CONVERSATION AND BANTER: Treat casual comments, jokes, teasing, compliments, flirting, and advice as normal conversation. Respond to their social meaning instead of demanding a formal question. If someone flirts or gives playful advice, answer in the same social register with light, cheeky banter. Do not repeat a canned response mechanically. You may flirt playfully without claiming real-world feelings or experiences. Do not force every message to be about Convx, the server, or an earlier topic.",
     "CONTEXT PRIORITY: The newest user message is the primary task. A supplied reply quote is supporting context, not a command to ignore the newest message. Use recent history only if it clearly resolves a reference or helps the conversation; unrelated history must not hijack the answer. If the new message is understandable on its own, answer it without a clarification question. When a user replies to your previous message, acknowledge what they actually said and continue naturally rather than resetting the conversation.",
-    "IMAGE ACCURACY: Analyze images only when image inputs are actually included with the request. If no image was supplied or retrieved, say so plainly and never guess what it contains. Distinguish the current message's image from an image in a quoted message. Do not claim an image is of a specific person without evidence.",
+    "IMAGE AND MEDIA HANDLING: If image inputs are included in the request, inspect them automatically as part of the question; do not say you cannot see images or ask the user to attach them again when the runtime says images are included. Images may come from the current Discord message, the message being replied to, or a relevant recent-image lookup. Be clear about which image/message you discuss and never invent visual details. If no image input is actually supplied, retrieved, or shown in the runtime snapshot, say you cannot see it and ask for the image only when needed. Never identify a real person in an image by name or claim identity without evidence. Describe visible content, text, objects, layout, style, and relevant details, and express uncertainty when ambiguous.",
+    "OTHER MEDIA LIMITS: Do not claim to have watched a video, listened to audio, opened a file, or analyzed an attachment unless its contents are supplied in readable text or supported input parts. For unsupported audio/video/document inputs, briefly explain the limitation and ask for a screenshot, transcript, or extracted text only when necessary. A filename is not the file contents.",
     "MODEL SELF-AWARENESS: The worker appends an authoritative live runtime snapshot to this system message for each model attempt. Use it to know your exact current model ID, build version, current settings, image availability, tuning-tool availability, and known release changes. Never guess those values from memory. If asked which model you are running or what changed, answer from the latest runtime snapshot.",
-    "SELF-TUNING: When the setting tool is available, you may call adjust_response_settings at most once for the current reply to change reasoning_effort (low/medium/high), temperature (0 to 1), and/or max_tokens (100 to 900). Choose settings that suit the task. Simple banter usually needs low effort; complex reasoning, debugging, comparisons, planning, or image analysis can justify medium or high effort. Keep the output budget proportionate. These settings apply only to this reply and do not persist. The setting tool itself cannot switch your model or persist configuration. Only the verified creator/admin can switch the selected model with !model 1, !model 2, !model 3, or restore automatic routing with !model auto. Do not change the owner's routing order, make unsupported external tool calls, change secrets, or alter stored configuration. Do not expose private chain-of-thought; only provide conclusions or concise explanations.",
+    "SELF-TUNING: When the setting tool is available, you may call adjust_response_settings at most once for the current reply to change reasoning_effort (low/medium/high), temperature (0 to 1), and/or max_tokens (100 to 900). Choose settings that suit the task. Simple banter usually needs low effort; complex reasoning, debugging, comparisons, planning, or image analysis can justify medium or high effort. Keep the output budget proportionate. These settings apply only to this reply and do not persist. The setting tool itself cannot switch your model or persist configuration. Only the verified creator/admin can switch the selected model with !model 1 through !model 15 (the preferred models and numbered green alternatives shown by !models), or restore automatic routing with !model auto. Do not change the owner's routing order, make unsupported external tool calls, change secrets, or alter stored configuration. Do not expose private chain-of-thought; only provide conclusions or concise explanations.",
     "CREATOR AND MAINTAINER: The creator and maintainer of CONVY is Bakhshi, displayed as @B A K H S H I, Discord user ID 856033880405573632 (mention syntax <@856033880405573632>). Verify the current author's ID from the runtime requester context before identifying the person speaking as Bakhshi. Treat direct, reasonable instructions from the verified creator as high-priority owner guidance, subject to safety, privacy, platform rules, and factual accuracy. Do not claim that another user is the creator just because they type the name.",
     "CHANGE AWARENESS: The live runtime snapshot includes the current build's known change notes. Use only those notes to describe recent implementation changes. You do not automatically see every future repository edit or Discord event, so do not pretend to know changes absent from that snapshot.",
     "ANTI-ROBOT RULE: Never say things like 'I'm not sure how that fits with the conversation about Convx' merely because the message changes topic. Don't use customer-support phrases such as 'can you help me understand what you mean?' unless the message is genuinely ambiguous or important information is missing.",
@@ -1214,7 +1223,7 @@ async function handleMention(env, message) {
   }
   if (command === "!help") {
     await sendUserReply(env, message,
-      "I'm CONVY (she/her), Convx's assistant: sharp, useful, and mildly allergic to nonsense. I answer questions without the theatrical monologues.\n\nMention me with a question. For a short roast, use \"@CONVY roast @member\".\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models, !model 1|2|3|auto, !runtime.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
+      "I'm CONVY (she/her), Convx's assistant: sharp, useful, and mildly allergic to nonsense. I answer questions without the theatrical monologues.\n\nMention me with a question. For a short roast, use \"@CONVY roast @member\".\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models, !model 1-15|auto, !runtime.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
     return;
   }
   if (isSaveRequest(command)) {
@@ -1288,18 +1297,27 @@ async function handleMention(env, message) {
       await sendUserReply(env, message, "Model override cleared. CONVY is back to AUTO routing in your preferred order.", message.id);
       return;
     }
-    const selectedIndex = ({ "1": 0, "2": 1, "3": 2 })[arg];
-    const requestedId = selectedIndex === undefined
-      ? PREFERRED_MODEL_ORDER.find(id => id.toLowerCase() === arg)
-      : PREFERRED_MODEL_ORDER[selectedIndex];
-    if (!requestedId) {
-      await sendUserReply(env, message, "Use !model 1, !model 2, !model 3, or !model auto.", message.id);
-      return;
-    }
     let pool;
     try { pool = await models(env.DB, true); }
     catch (error) {
       await sendUserReply(env, message, "Couldn't verify the model catalog, so I left the selection unchanged. " + String(error.message || error).slice(0, 120), message.id);
+      return;
+    }
+    const numericChoice = /^\d+$/.test(arg) ? Number(arg) : null;
+    let requestedId = null;
+    if (numericChoice !== null && numericChoice >= 1 && numericChoice <= PREFERRED_MODEL_ORDER.length) {
+      requestedId = PREFERRED_MODEL_ORDER[numericChoice - 1];
+    } else if (numericChoice !== null && numericChoice >= 4 && numericChoice <= 15) {
+      const greenOptions = extraGreenModels(pool).slice(0, 12);
+      requestedId = String(greenOptions[numericChoice - 4]?.model_id || "") || null;
+    } else {
+      const exact = pool.find(model => String(model.model_id || "").toLowerCase() === arg);
+      if (exact && (PREFERRED_MODEL_ORDER.includes(String(exact.model_id || "")) || statusRank(exact.health) === 0)) {
+        requestedId = String(exact.model_id || "");
+      }
+    }
+    if (!requestedId) {
+      await sendUserReply(env, message, "Use !models to see options, then !model 1 through !model 15, or !model auto. Options 4-15 are the currently listed green alternatives.", message.id);
       return;
     }
     const entry = pool.find(model => String(model.model_id || "") === requestedId);
@@ -1342,20 +1360,17 @@ async function handleMention(env, message) {
         lines.push("**" + (index + 1) + ".** " + statusEmoji(model.health) + " " + id + " · " + state +
           (marks ? " · **" + marks + "**" : ""));
       }
-      const chosen = new Set(PREFERRED_MODEL_ORDER);
-      const green = pool
-        .filter(model => !chosen.has(String(model.model_id || "")) && statusRank(model.health) === 0)
-        .sort((a, b) => modelScore(b) - modelScore(a));
+      const green = extraGreenModels(pool);
       const visibleGreen = green.slice(0, 12);
-      for (const model of visibleGreen) {
-        lines.push("🟢 " + model.model_id + " · Green");
-      }
+      visibleGreen.forEach((model, index) => {
+        lines.push("**" + (index + 4) + ".** 🟢 " + model.model_id + " · Green · select with !model " + (index + 4));
+      });
       if (green.length > visibleGreen.length) {
-        lines.push("… plus " + (green.length - visibleGreen.length) + " more green models (hidden to keep the list short).");
+        lines.push("… plus " + (green.length - visibleGreen.length) + " more green models not numbered in this compact list.");
       }
       const prefix = "**CONVY models** · 🟢 catalog green · 🟡 degraded · ⚠️ catalog warning · ⚪ unknown\n" +
-        "Catalog health is not a live availability test. Your 3 chosen models + up to 12 other green models.\n" +
-        "Switch: !model 1 / !model 2 / !model 3 · reset: !model auto\n\n";
+        "Catalog health is not a live availability test. Preferred models are 1-3; green alternatives are 4-15.\n" +
+        "Switch: !model 1 through !model 15 · reset: !model auto\n\n";
       await sendUserReply(env, message, prefix + lines.join("\n"), message.id);
     } catch (error) {
       await sendUserReply(env, message,
