@@ -26,6 +26,25 @@ const CONVY_CURRENT_RELEASE_NOTES = [
 ];
 const CONVY_RELEASE_HISTORY = [
   {
+    version: "convx-2026-10-18-r18",
+    commit: "35384cdb18cbd204e3ab04484d8ec844584473e1",
+    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39151300137",
+    changes: [
+      "Add a concise teammate-style response layer with answer-first replies and lightweight Discord Markdown.",
+      "Strengthen truthful tool-use claims and require verified runtime data for model health, pricing, and deployment status."
+    ]
+  },
+  {
+    version: "convx-2026-10-18-r17",
+    appliedAt: "2026-10-18T17:44:46.021448Z",
+    commit: "c2332503b622528a8f22d8c6c272626f00e7df25",
+    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39150951598",
+    changes: [
+      "Fix model-selection race by reusing the current verified Durable Object catalog snapshot instead of immediately forcing a second live fetch.",
+      "Expose whether a live model catalog snapshot was saved and include build version in !models output."
+    ]
+  },
+  {
     version: "convx-2026-10-18-r16",
     appliedAt: "2026-10-18T17:33:17.065651Z",
     commit: "d4c6390bcc4001af854ebc9e2a8ff08a530f91b3",
