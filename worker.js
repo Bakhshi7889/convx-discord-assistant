@@ -33,10 +33,10 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r23";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r24";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Add a verified-adult Discord role gate for mature roleplay using role ID 1530567633366155284; users without the role cannot access mature mode.",
-  "Pass a concise adult-mode instruction only for verified-role members, while preserving ordinary chat, memory, commands, and provider routing."
+  "Refine the verified-adult content-mode instruction so it preserves CONVY's existing independent personality and conversational style instead of switching her into a dedicated roleplay bot.",
+  "Only adapt the tone when an appropriately verified adult explicitly requests mature content; preserve ordinary chat, memory, commands, and provider routing."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -2556,7 +2556,7 @@ async function handleMention(env, message) {
   }
   try {
     const adultModeQuery = verifiedAdult
-      ? "[Verified-adult role confirmed by Discord. The server is designated for adults. If the user requests mature fictional roleplay, match the requested tone and level of detail naturally. Keep all participants clearly adult and interactions consensual; do not introduce this mode unless the user asks.]" + "\n" + resolveUserMentions(query, message)
+      ? "[Verified-adult role confirmed by Discord. Preserve CONVY's established independent personality, backstory, conversational behavior, and normal response style. Do not switch into a dedicated roleplay-bot persona. If an appropriately verified adult explicitly requests mature content, adapt the tone to that request while keeping all participants clearly adult and interactions consensual. Do not introduce mature content unless the user asks.]" + "\n" + resolveUserMentions(query, message)
       : resolveUserMentions(query, message);
     const answer = await generateAnswer(env, env.DB, adultModeQuery, message.channel_id, message);
     await sendUserReply(env, message, answer, message.id);
