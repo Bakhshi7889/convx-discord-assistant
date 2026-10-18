@@ -701,6 +701,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
             temperature: currentSettings.temperature,
             max_tokens: currentSettings.max_tokens,
             reasoning_effort: currentSettings.reasoning_effort,
+            tools: RESPONSE_SETTINGS_TOOL,
             tool_choice: "none"
           }),
           signal: AbortSignal.timeout(MODEL_TIMEOUT_MS)
