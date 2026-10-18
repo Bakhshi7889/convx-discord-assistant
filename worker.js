@@ -18,13 +18,24 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r16";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r17";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Use Pollinations GET /models?source=community&reliability=reliable, then require health.status=healthy and explicitly zero known input/output prices.",
-  "Reject unknown or stale model catalog schemas so the previous looser reliability=all cache cannot be used for routing.",
-  "Show Discord's native typing indicator while CONVY processes addressed messages, refreshing every eight seconds and stopping when the response completes."
+  "Fix model-selection race: !model reuses the current verified one-hour Durable Object catalog snapshot instead of forcing an unnecessary second live fetch.",
+  "Report whether the live model list was successfully saved to Durable Object storage so later selection failures are not hidden.",
+  "Include the actual build version in !models output for easier runtime diagnostics."
 ];
 const CONVY_RELEASE_HISTORY = [
+  {
+    version: "convx-2026-10-18-r16",
+    appliedAt: "2026-10-18T17:33:17.065651Z",
+    commit: "d4c6390bcc4001af854ebc9e2a8ff08a530f91b3",
+    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39150085098",
+    changes: [
+      "Use Pollinations GET /models?source=community&reliability=reliable, then require health.status=healthy and explicitly zero known input/output prices.",
+      "Reject unknown or stale model catalog schemas so the previous looser reliability=all cache cannot be used for routing.",
+      "Show Discord's native typing indicator while CONVY processes addressed messages, refreshing every eight seconds and stopping when the response completes."
+    ]
+  },
   {
     version: "convx-2026-10-18-r15",
     appliedAt: "2026-10-18T17:25:16.057764Z",
@@ -34,16 +45,6 @@ const CONVY_RELEASE_HISTORY = [
       "Fetch the live Pollinations community model catalog for !models and show the catalog timestamp.",
       "Cache verified free-model catalog data and local model-performance stats in Durable Object storage with a one-hour lazy-refresh interval, eliminating model-catalog and per-attempt metrics writes to D1.",
       "Treat stale catalog data as display-only: do not use it for model selection or new inference requests when the live catalog cannot be verified."
-    ]
-  },
-  {
-    version: "convx-2026-10-18-r14",
-    appliedAt: "2026-10-18T16:44:03.937201Z",
-    commit: "81638c3dec06672c01bd50a9551df728cafcb594",
-    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39146304759",
-    changes: [
-      "Added runtime-injected Git commit, source commit timestamp, deployment timestamp, and deployment-run link, plus !version and !changes commands.",
-      "Added image search with visible image embeds and source links using DuckDuckGo, with Wikimedia Commons fallback and attribution metadata where available."
     ]
   }
 ];
@@ -794,7 +795,8 @@ async function models(env, force = false) {
       checkedAt,
       stale: false,
       lastSuccessfulModel,
-      source: "Durable Object hourly snapshot"
+      source: "Durable Object hourly snapshot",
+      cacheSaved: true
     };
   }
 
@@ -840,14 +842,16 @@ async function models(env, force = false) {
       lastSuccessfulModel,
       lastSuccessfulAt: Number(previous?.lastSuccessfulAt || 0)
     };
+    let cacheSaved = false;
     try {
       await gatewayControl(env, "/models/catalog", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(snapshot)
       });
+      cacheSaved = true;
     } catch (error) {
-      // A live response is still usable for this request, but won't be cached if the DO is down.
+      // A live response is still usable for this display, but selection may need another fetch.
       console.log("Durable model catalog write skipped: " + String(error.message || error).slice(0, 100));
     }
 
@@ -855,6 +859,7 @@ async function models(env, force = false) {
       models: sortModelRows(eligible),
       checkedAt: snapshot.checkedAt,
       stale: false,
+      cacheSaved,
       lastSuccessfulModel,
       source: "live Pollinations community catalog"
     };
@@ -866,6 +871,7 @@ async function models(env, force = false) {
         stale: true,
         lastSuccessfulModel,
         source: "stale Durable Object snapshot",
+        cacheSaved: false,
         error: String(error.message || error).slice(0, 160)
       };
     }
@@ -1950,13 +1956,17 @@ async function handleMention(env, message) {
       return;
     }
     let catalog;
-    try { catalog = await models(env, true); }
+    try { catalog = await models(env, false); }
     catch (error) {
       await sendUserReply(env, message, "Couldn't verify the live model catalog, so I left the selection unchanged. " + String(error.message || error).slice(0, 120), message.id);
       return;
     }
     if (catalog.stale) {
       await sendUserReply(env, message, "The live Pollinations catalog is unavailable. I left the model selection unchanged rather than trust stale pricing or eligibility.", message.id);
+      return;
+    }
+    if (!catalog.cacheSaved) {
+      await sendUserReply(env, message, "I found models in the live response, but couldn't save the verified catalog snapshot. I left your selection unchanged so I don't route using unshared or unverifiable model data.", message.id);
       return;
     }
     const pool = catalog.models;
@@ -2032,8 +2042,11 @@ async function handleMention(env, message) {
         ? "⚠️ **STALE CATALOG** · last successful fetch: " + (catalog.checkedAt ? new Date(catalog.checkedAt).toISOString() : "unknown") +
           " · cached models are shown for reference only and cannot be selected or routed."
         : "✅ **LIVE CATALOG** · fetched " + new Date(catalog.checkedAt).toISOString() + " · catalog refresh uses zero D1 writes.";
-      const prefix = "**CONVY models** · 🟢 catalog green · 🟡 degraded · ⚠️ catalog warning · ⚪ unknown\n" +
-        catalogStatus + "\n" +
+      const cacheStatus = catalog.cacheSaved
+        ? "Snapshot saved in Durable Object storage."
+        : "⚠️ Live catalog fetched, but snapshot saving failed. A later !model command may require another live fetch.";
+      const prefix = "**CONVY models · " + buildMetadata(env).version + "** · 🟢 catalog green · 🟡 degraded · ⚠️ catalog warning · ⚪ unknown\n" +
+        catalogStatus + "\n" + cacheStatus + "\n" +
         "Preferred models are 1-3; green alternatives are 4-15. Use !model 1 through !model 15 · reset with !model auto.\n\n";
       await sendUserReply(env, message, prefix + lines.join("\n"), message.id);
     } catch (error) {
