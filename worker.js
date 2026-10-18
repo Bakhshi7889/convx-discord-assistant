@@ -303,11 +303,17 @@ function modelScore(model) {
     : 25 * Math.max(0, Math.min(1, Number(model.success_rate) || 0));
   const localRate = localModelSuccessRate(model);
   const localPoints = localRate == null ? 15 : 25 * localRate;
+  const attempts = Math.max(0, Number(model.local_success_count) || 0) +
+    Math.max(0, Number(model.local_failure_count) || 0);
+  // Small Bayesian prior prevents one lucky reply from instantly crowning a model.
+  const localPointsSmoothed = attempts > 0
+    ? 25 * (((Number(model.local_success_count) || 0) + 2) / (attempts + 4))
+    : localPoints;
   const latency = Number(model.avg_latency_ms) || 0;
   const speedPoints = latency > 0 ? 15 * (1 - Math.min(12000, Math.max(0, latency)) / 12000) : 8;
   const requests = Math.max(0, Number(model.request_count) || 0);
   const confidencePoints = 5 * Math.min(1, requests / 50);
-  return Math.max(0, Math.min(100, Math.round(healthPoints + providerRate + localPoints + speedPoints + confidencePoints)));
+  return Math.max(0, Math.min(100, Math.round(healthPoints + providerRate + localPointsSmoothed + speedPoints + confidencePoints)));
 }
 function sortModelRows(rows) {
   return [...rows].sort((a, b) =>
@@ -345,31 +351,87 @@ async function models(db, force=false) {
   return sortModelRows(cached.results||[]);
 }
 async function recordModelResult(db,id,elapsed,succeeded) {
-  const ms=Math.max(0,Math.round(Number(elapsed)||0));
-  await db.prepare("UPDATE models SET avg_latency_ms=CASE WHEN ? THEN CASE WHEN avg_latency_ms<=0 THEN ? ELSE (avg_latency_ms*0.7+?*0.3) END ELSE avg_latency_ms END,local_success_count=local_success_count+CASE WHEN ? THEN 1 ELSE 0 END,local_failure_count=local_failure_count+CASE WHEN ? THEN 0 ELSE 1 END WHERE model_id=?")
-    .bind(succeeded?1:0,ms,ms,succeeded?1:0,succeeded?1:0,id).run();
+  const ms = Math.max(0, Math.round(Number(elapsed) || 0));
+  // Track elapsed time for failures too; otherwise broken models look mysteriously fast forever.
+  await db.prepare(
+    "UPDATE models SET avg_latency_ms=CASE WHEN avg_latency_ms<=0 THEN ? ELSE (avg_latency_ms*0.7+?*0.3) END," +
+    "local_success_count=local_success_count+CASE WHEN ? THEN 1 ELSE 0 END," +
+    "local_failure_count=local_failure_count+CASE WHEN ? THEN 0 ELSE 1 END WHERE model_id=?"
+  ).bind(ms, ms, succeeded ? 1 : 0, succeeded ? 1 : 0, id).run();
 }
+
 async function callFreeModel(env,db,messages,maxTokens=550) {
-  if(!env.POLLINATIONS_API_KEY)throw new Error("Pollinations API key is not configured yet.");
-  const candidates=await models(db);
-  if(!candidates.length)throw new Error("Pollinations returned no community text models with no billed text-token rates. The catalog is cached hourly; paid-only and nonzero-priced models are excluded.");
-  let attempts=0;
-  for(const model of candidates){
-    if(attempts>=MODEL_ATTEMPT_LIMIT)break;
-    attempts++;
-    const id=model.model_id||model.id,started=Date.now();let recorded=false;
-    try{
-      const r=await fetch(POLLINATIONS_API+"/v1/chat/completions",{method:"POST",headers:{"Authorization":"Bearer "+env.POLLINATIONS_API_KEY,"Content-Type":"application/json","Accept":"application/json"},body:JSON.stringify({model:id,messages,temperature:0.25,max_tokens:maxTokens}),signal:AbortSignal.timeout(MODEL_TIMEOUT_MS)});
-      if(r.status===402){await recordModelResult(db,id,Date.now()-started,false);recorded=true;throw new Error("Pollinations returned payment-required for a model marked free. Stopped without paid fallback.");}
-      if(!r.ok){await recordModelResult(db,id,Date.now()-started,false);recorded=true;continue;}
-      const data=await r.json(),text=data.choices?.[0]?.message?.content,ok=typeof text==="string"&&Boolean(text.trim());
-      await recordModelResult(db,id,Date.now()-started,ok);recorded=true;
-      if(ok)return {content:text.trim(),modelId:id};
-    }catch(error){if(!recorded){try{await recordModelResult(db,id,Date.now()-started,false);}catch{}}
-      if(String(error?.message||error).includes("payment-required"))throw error;}
+  if (!env.POLLINATIONS_API_KEY) throw new Error("Pollinations API key is not configured yet.");
+  const pool = await models(db);
+  if (!pool.length) {
+    throw new Error("Pollinations returned no eligible community text models with no billed text-token rates. The catalog is cached hourly; paid-only and nonzero-priced models are excluded.");
   }
-  throw new Error("The cached zero-priced models failed or timed out. No paid model was attempted.");
+
+  // Never spend requests on models the provider currently reports as down.
+  const candidates = pool.filter(model => statusRank(model.health) !== 2);
+  if (!candidates.length) throw new Error("All eligible community text models are currently reported down. No model was called.");
+  const preferredId = await setting(db, "preferred_model_id");
+  const preferredIndex = candidates.findIndex(model =>
+    model.model_id === preferredId &&
+    (Number(model.local_success_count) || 0) > (Number(model.local_failure_count) || 0)
+  );
+  if (preferredIndex > 0) candidates.unshift(candidates.splice(preferredIndex, 1)[0]);
+
+  let attempts = 0;
+  let lastFailure = "No model returned a usable answer.";
+  for (const model of candidates) {
+    if (attempts >= MODEL_ATTEMPT_LIMIT) break;
+    attempts++;
+    const id = model.model_id || model.id, started = Date.now();
+    let recorded = false;
+    try {
+      const response = await fetch(POLLINATIONS_API + "/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + env.POLLINATIONS_API_KEY,
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        body: JSON.stringify({ model: id, messages, temperature: 0.25, max_tokens: maxTokens }),
+        signal: AbortSignal.timeout(MODEL_TIMEOUT_MS)
+      });
+      if (response.status === 402) {
+        await recordModelResult(db, id, Date.now() - started, false);
+        recorded = true;
+        throw new Error("payment-required");
+      }
+      if (!response.ok) {
+        let detail = "";
+        try { detail = (await response.text()).slice(0, 90).replace(/[\r\n]+/g, " "); } catch {}
+        await recordModelResult(db, id, Date.now() - started, false);
+        recorded = true;
+        lastFailure = id + " returned HTTP " + response.status + (detail ? ": " + detail : "");
+        continue;
+      }
+      const data = await response.json();
+      const answer = data.choices?.[0]?.message?.content;
+      const succeeded = typeof answer === "string" && Boolean(answer.trim());
+      await recordModelResult(db, id, Date.now() - started, succeeded);
+      recorded = true;
+      if (succeeded) {
+        await setSetting(db, "preferred_model_id", id);
+        await setSetting(db, "preferred_model_last_success_ms", Date.now());
+        return { content: answer.trim(), modelId: id };
+      }
+      lastFailure = id + " returned an empty answer.";
+    } catch (error) {
+      if (!recorded) {
+        try { await recordModelResult(db, id, Date.now() - started, false); } catch {}
+      }
+      if (String(error?.message || error).includes("payment-required")) {
+        throw new Error("A model listed without billed text rates returned payment-required. Stopped immediately; no paid fallback was attempted.");
+      }
+      lastFailure = id + " failed or timed out: " + String(error?.message || error).slice(0, 110);
+    }
+  }
+  throw new Error("The top " + attempts + " eligible, non-down community models failed. Last failure: " + lastFailure + ". No paid model was attempted.");
 }
+
 async function generateAnswer(env,db,query,channelId) {
   const context = await searchContext(db, channelId, query), clean = normalize(query);
   const direct = (context.knowledge || []).find(x => normalize(x.question) === clean);
@@ -519,6 +581,7 @@ async function handleMention(env, message) {
     }
     try {
       const pool = await models(env.DB, true);
+      const preferredId = await setting(env.DB, "preferred_model_id");
       const lines = pool.map((model, index) => {
         const score = modelScore(model);
         const provider = model.success_rate == null
@@ -532,11 +595,13 @@ async function handleMention(env, message) {
         const latency = Number(model.avg_latency_ms) > 0
           ? "~" + Math.round(model.avg_latency_ms) + "ms"
           : "speed unmeasured";
+        const preferred = model.model_id === preferredId && (Number(model.local_success_count) || 0) > (Number(model.local_failure_count) || 0);
         return "#" + (index + 1) + " · **" + score + "/100** · " + statusEmoji(model.health) +
-          " " + model.model_id + " · " + provider + " · " + local + " · " + latency + " · " + model.source;
+          " " + model.model_id + (preferred ? " · ★ CONVY default" : "") +
+          " · " + provider + " · " + local + " · " + latency + " · " + model.source;
       });
       const intro = "**CONVY's verified-free text model leaderboard**\n" +
-        "Found " + pool.length + " model(s). Ranked by score /100: health (30), provider success (25), CONVY's observed success (25), speed (15), and provider sample confidence (5). New models get provisional scores until tested.\n" +
+        "Found " + pool.length + " model(s). Ranked by score /100: provider health (30), provider success (25), CONVY's smoothed observed success (25), speed (15), and provider sample confidence (5). The ★ marks the current CONVY default. New models get provisional scores until tested.\n" +
         "Only community text models with no billed text-token rates qualify. Models marked paid_only or with positive/unknown text rates are excluded. No paid fallback. Catalog refreshed now; normal refresh is hourly.\n\n";
       await sendReply(env, message.channel_id,
         pool.length ? intro + lines.join("\n") :
