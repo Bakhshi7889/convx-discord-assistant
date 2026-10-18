@@ -1204,6 +1204,61 @@ function resolveUserMentions(query, message) {
     return name ? "@" + name : "the mentioned member";
   });
 }
+function discordCdnImage(user, field) {
+  const hash = String(user?.[field] || "");
+  const id = String(user?.id || "");
+  if (!/^\d{15,22}$/.test(id)) return "";
+  if (field === "avatar" && hash) return "https://cdn.discordapp.com/avatars/" + id + "/" + hash + (hash.startsWith("a_") ? ".gif" : ".png") + "?size=512";
+  if (field === "banner" && hash) return "https://cdn.discordapp.com/banners/" + id + "/" + hash + (hash.startsWith("a_") ? ".gif" : ".png") + "?size=512";
+  if (field === "avatar") {
+    let index = 0;
+    try { index = Number((BigInt(id) >> 22n) % 6n); } catch {}
+    return "https://cdn.discordapp.com/embed/avatars/" + index + ".png";
+  }
+  return "";
+}
+function discordAccountCreatedAt(id) {
+  try { return new Date(Number((BigInt(id) >> 22n) + 1420070400000n)).toISOString(); }
+  catch { return "Unavailable"; }
+}
+async function getMemberInspection(env, message) {
+  const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+  const target = mentions.find(user => user && String(user.id) !== String(env.BOT_USER_ID || "") && String(user.id) !== String(message.author?.id || ""));
+  if (!target?.id) throw new Error("Tag the member you want to inspect, for example: !inspect @member.");
+  const userId = String(target.id);
+  let user = target;
+  try { user = await discord(env, "/users/" + userId); }
+  catch (error) { console.log("Discord user detail lookup skipped: " + String(error.message || error).slice(0, 100)); }
+  let member = null;
+  try { member = await discord(env, "/guilds/" + env.GUILD_ID + "/members/" + userId); }
+  catch (error) { console.log("Discord guild-member lookup skipped: " + String(error.message || error).slice(0, 100)); }
+  let roleNames = (member?.roles || []).map(String);
+  try {
+    const guildRoles = await discord(env, "/guilds/" + env.GUILD_ID + "/roles");
+    const roleMap = new Map((guildRoles || []).map(role => [String(role.id), String(role.name || role.id)]));
+    roleNames = roleNames.map(id => roleMap.get(id) || id);
+  } catch {}
+  const avatarUrl = discordCdnImage(user, "avatar");
+  const bannerUrl = discordCdnImage(user, "banner");
+  const username = String(user.username || target.username || "Unknown user");
+  const displayName = String(member?.nick || user.global_name || target.global_name || username);
+  const bio = typeof user.bio === "string" && user.bio.trim() ? user.bio.trim().slice(0, 1000) : "";
+  const lines = [
+    "Display name: " + displayName,
+    "Username: " + username,
+    "User ID: " + userId,
+    "Account created: " + discordAccountCreatedAt(userId),
+    "Server nickname: " + String(member?.nick || "(none)"),
+    "Server joined: " + String(member?.joined_at || "Unavailable"),
+    "Server roles: " + (roleNames.length ? roleNames.join(", ") : "(none returned)"),
+    "Bot account: " + (user.bot ? "yes" : "no"),
+    "Public avatar URL: " + (avatarUrl || "(unavailable)"),
+    "Public banner URL: " + (bannerUrl || "(not set or unavailable)"),
+    "Profile bio: " + (bio || "(not included in the Discord bot API response; do not invent one)")
+  ];
+  return { targetName: displayName, text: lines.join("\n"), images: [avatarUrl, bannerUrl].filter(Boolean).map(url => ({ url, detail: "high" })) };
+}
+
 async function handleMention(env, message) {
   if (message.author?.bot) return;
   const botId = String(env.BOT_USER_ID || "");
@@ -1213,6 +1268,31 @@ async function handleMention(env, message) {
   const isReply = await isReplyToBot(env, message);
   if (!isMention && !isReply) return;
   const query = String(message.content || "").replace(mention, "").trim();
+  const normalizedInput = normalize(query);
+  const startRequested = /^!start$/.test(normalizedInput) || /^(?:please )?(?:start replying|resume replying|come back|you can talk again)(?: now)?$/.test(normalizedInput);
+  const stopRequested = /^!pause$/.test(normalizedInput) || /^(?:please )?(?:shut up|stop replying|stop responding|stop talking|be quiet|go quiet|mute yourself|pause)(?: now)?$/.test(normalizedInput);
+  if (isCreator(message) && startRequested) {
+    try {
+      await setBotPaused(env, false, message.author.id);
+      await sendUserReply(env, message, "I'm back. The pause is off.", message.id);
+    } catch (error) {
+      await sendUserReply(env, message, "I couldn't change the pause switch: " + String(error.message || error).slice(0, 140), message.id);
+    }
+    return;
+  }
+  if (isCreator(message) && stopRequested) {
+    try {
+      await setBotPaused(env, true, message.author.id);
+      await sendUserReply(env, message, "Got it. I'll stay quiet until you tell me to start again.", message.id);
+    } catch (error) {
+      await sendUserReply(env, message, "I couldn't activate the pause switch, so I may still respond: " + String(error.message || error).slice(0, 140), message.id);
+    }
+    return;
+  }
+  let paused = false;
+  try { paused = await botIsPaused(env); }
+  catch (error) { console.log("Pause-state read failed; continuing with bot available: " + String(error.message || error).slice(0, 100)); }
+  if (paused) return;
   if (!query) {
     await sendUserReply(env, message, "hey, I'm here. what's up?", message.id);
     return;
@@ -1244,9 +1324,181 @@ async function handleMention(env, message) {
     await sendUserReply(env, message, "hey. what's up?", message.id);
     return;
   }
-  const roast = buildMemberRoast(command, message, env);
-  if (roast?.handled) {
-    await sendUserReply(env, message, roast.content, message.id, { users: roast.targetUserId ? [roast.targetUserId] : [] });
+  if (command.startsWith("!inspect")) {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Profile inspection is creator-only.", message.id);
+      return;
+    }
+    try {
+      const profileInspection = await getMemberInspection(env, message);
+      const prompt = "Inspect this Discord member's public profile, especially the supplied avatar/banner. Describe visible, non-sensitive details and profile aesthetics; separate facts from interpretation and do not invent a bio.\nMember: " + profileInspection.targetName;
+      const answer = await generateAnswer(env, env.DB, prompt, message.channel_id, message, { profileInspection });
+      await sendUserReply(env, message, answer, message.id);
+    } catch (error) {
+      await sendUserReply(env, message, "I couldn't inspect that profile. " + String(error.message || error).slice(0, 180), message.id);
+    }
+    return;
+  }
+  if (command === "!search" || command.startsWith("!search ")) {
+    const searchQuery = command.slice("!search".length).trim();
+    if (!searchQuery) {
+      await sendUserReply(env, message, "Use !search followed by a topic or question.", message.id);
+      return;
+    }
+    if ((await setting(env.DB, "web_search_enabled")) === "off") {
+      await sendUserReply(env, message, "Web search is disabled by the creator.", message.id);
+      return;
+    }
+    try {
+      const answer = await generateAnswer(env, env.DB, searchQuery, message.channel_id, message, { forceWebSearch: true });
+      await sendUserReply(env, message, answer, message.id);
+    } catch (error) {
+      await sendUserReply(env, message, "I couldn't complete the web search. " + String(error.message || error).slice(0, 180), message.id);
+    }
+    return;
+  }
+  if (command === "!config") {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Runtime configuration is creator-only.", message.id);
+      return;
+    }
+    let pausedState = false;
+    try { pausedState = await botIsPaused(env); } catch {}
+    const selected = await setting(env.DB, "owner_selected_model_id");
+    const reasoning = await setting(env.DB, "reasoning_override");
+    const temperature = await setting(env.DB, "temperature_override");
+    const maxTokens = await setting(env.DB, "max_tokens_override");
+    const webEnabled = (await setting(env.DB, "web_search_enabled")) !== "off";
+    await sendUserReply(env, message,
+      "**CONVY owner configuration**\n" +
+      "Paused: " + (pausedState ? "yes" : "no") + "\n" +
+      "Model: " + (selected || "AUTO") + "\n" +
+      "Reasoning: " + (reasoning || "AUTO per message") + "\n" +
+      "Temperature: " + (temperature || "AUTO per message") + "\n" +
+      "Max tokens: " + (maxTokens || "AUTO per message") + "\n" +
+      "Web search: " + (webEnabled ? "on" : "off") + "\n\n" +
+      "Commands: !model 1-15|auto, !reasoning low|medium|high|auto, !temperature 0-1|auto, !maxtokens 100-900|auto, !web on|off, !pause, !start, !memory, !context, !inspect @member, !search query.",
+      message.id);
+    return;
+  }
+  if (command === "!reasoning" || command.startsWith("!reasoning ")) {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Only the creator can change reasoning settings.", message.id);
+      return;
+    }
+    const arg = command.slice("!reasoning".length).trim().toLowerCase();
+    if (arg === "auto") await setSetting(env.DB, "reasoning_override", "");
+    else if (["low", "medium", "high"].includes(arg)) await setSetting(env.DB, "reasoning_override", arg);
+    else {
+      const current = await setting(env.DB, "reasoning_override");
+      await sendUserReply(env, message, "Reasoning is " + (current || "AUTO per message") + ". Use !reasoning low, !reasoning medium, !reasoning high, or !reasoning auto.", message.id);
+      return;
+    }
+    await sendUserReply(env, message, "Reasoning set to " + (arg === "auto" ? "AUTO per message" : arg) + ".", message.id);
+    return;
+  }
+  if (command === "!temperature" || command.startsWith("!temperature ")) {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Only the creator can change temperature.", message.id);
+      return;
+    }
+    const arg = command.slice("!temperature".length).trim().toLowerCase();
+    if (arg === "auto") await setSetting(env.DB, "temperature_override", "");
+    else {
+      const value = Number(arg);
+      if (!arg || !Number.isFinite(value) || value < 0 || value > 1) {
+        const current = await setting(env.DB, "temperature_override");
+        await sendUserReply(env, message, "Temperature is " + (current || "AUTO per message") + ". Use !temperature 0 through 1, e.g. !temperature 0.65, or !temperature auto.", message.id);
+        return;
+      }
+      await setSetting(env.DB, "temperature_override", Math.round(value * 100) / 100);
+    }
+    await sendUserReply(env, message, "Temperature set to " + (arg === "auto" ? "AUTO per message" : String(Math.round(Number(arg) * 100) / 100)) + ".", message.id);
+    return;
+  }
+  if (command === "!maxtokens" || command.startsWith("!maxtokens ")) {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Only the creator can change the token budget.", message.id);
+      return;
+    }
+    const arg = command.slice("!maxtokens".length).trim().toLowerCase();
+    if (arg === "auto") await setSetting(env.DB, "max_tokens_override", "");
+    else {
+      const value = Number(arg);
+      if (!Number.isInteger(value) || value < 100 || value > 900) {
+        const current = await setting(env.DB, "max_tokens_override");
+        await sendUserReply(env, message, "Token budget is " + (current || "AUTO per message") + ". Use !maxtokens 100 through 900, or !maxtokens auto.", message.id);
+        return;
+      }
+      await setSetting(env.DB, "max_tokens_override", value);
+    }
+    await sendUserReply(env, message, "Token budget set to " + (arg === "auto" ? "AUTO per message" : arg) + ".", message.id);
+    return;
+  }
+  if (command === "!web" || command.startsWith("!web ")) {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Only the creator can change web search.", message.id);
+      return;
+    }
+    const arg = command.slice("!web".length).trim().toLowerCase();
+    if (arg === "on") await setSetting(env.DB, "web_search_enabled", "on");
+    else if (arg === "off") await setSetting(env.DB, "web_search_enabled", "off");
+    else {
+      const current = (await setting(env.DB, "web_search_enabled")) !== "off";
+      await sendUserReply(env, message, "Web search is " + (current ? "on" : "off") + ". Use !web on or !web off.", message.id);
+      return;
+    }
+    await sendUserReply(env, message, "Web search turned " + arg + ".", message.id);
+    return;
+  }
+  if (command === "!remember" || command.startsWith("!remember ")) {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Only the creator can save long-term memories.", message.id);
+      return;
+    }
+    const fact = command.slice("!remember".length).trim().slice(0, 1800);
+    if (!fact) {
+      await sendUserReply(env, message, "Use !remember followed by a stable fact CONVY should retain across conversations.", message.id);
+      return;
+    }
+    const saved = await env.DB.prepare("INSERT INTO knowledge(question,answer,tags,created_by) VALUES(?,?,?,?)")
+      .bind("Owner memory: " + fact.slice(0, 450), fact, "owner-memory", message.author.id).run();
+    await sendUserReply(env, message, "Saved long-term memory #" + saved.meta.last_row_id + ".", message.id);
+    return;
+  }
+  if (command === "!memory") {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Long-term memory is creator-only.", message.id);
+      return;
+    }
+    const rows = await env.DB.prepare("SELECT id,answer FROM knowledge WHERE lower(tags) LIKE '%owner-memory%' ORDER BY id DESC LIMIT 20").all();
+    const content = (rows.results || []).map(row => "#" + row.id + " · " + String(row.answer || "").slice(0, 450)).join("\n") || "No long-term memories saved. Use !remember fact.";
+    await sendUserReply(env, message, content, message.id);
+    return;
+  }
+  if (command === "!forget" || command.startsWith("!forget ")) {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Only the creator can remove long-term memories.", message.id);
+      return;
+    }
+    const id = Number(command.slice("!forget".length).trim());
+    if (!Number.isSafeInteger(id) || id < 1) {
+      await sendUserReply(env, message, "Use !forget MEMORY_ID.", message.id);
+      return;
+    }
+    const result = await env.DB.prepare("DELETE FROM knowledge WHERE id=? AND lower(tags) LIKE '%owner-memory%'").bind(id).run();
+    await sendUserReply(env, message, result.meta.changes ? "Forgot long-term memory #" + id + "." : "No owner memory found with that ID.", message.id);
+    return;
+  }
+  if (command === "!context") {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Context diagnostics are creator-only.", message.id);
+      return;
+    }
+    const rows = await env.DB.prepare("SELECT author_id,author_name,content,created_at FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT 14").bind(message.channel_id).all();
+    const items = (rows.results || []).reverse();
+    const transcript = items.map(row => "[" + row.created_at + "] " + (String(row.author_id) === String(env.BOT_USER_ID) ? "CONVY" : row.author_name) + ": " + String(row.content || "").slice(0, 190)).join("\n");
+    await sendUserReply(env, message, "**Recent context (" + items.length + " messages)**\n" + (transcript || "(none saved yet)"), message.id);
     return;
   }
   if (command === "!runtime") {
@@ -1268,7 +1520,9 @@ async function handleMention(env, message) {
   }
   if (command === "!help") {
     await sendUserReply(env, message,
-      "I'm CONVY (she/her), Convx's assistant: sharp, useful, and mildly allergic to nonsense. I answer questions without the theatrical monologues.\n\nMention me with a question. For a short roast, use \"@CONVY roast @member\".\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models, !model 1-15|auto, !runtime.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
+      "Mention me with a question or reply to one of my messages to continue the conversation. I keep recent channel context, and the creator can save long-term memories.\n\n" +
+      "**Creator controls:** !pause, !start, !config, !model 1-15|auto, !reasoning low|medium|high|auto, !temperature 0-1|auto, !maxtokens 100-900|auto, !web on|off, !remember fact, !memory, !forget ID, !context, !inspect @member, !search query.\n\n" +
+      "**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models, !runtime, save this.", message.id);
     return;
   }
   if (isSaveRequest(command)) {
@@ -1324,8 +1578,8 @@ async function handleMention(env, message) {
     return;
   }
   if (command === "!model" || command.startsWith("!model ")) {
-    if (!(await isAdmin(env, message))) {
-      await sendUserReply(env, message, "Only the configured Convx creator/admin can switch CONVY's model.", message.id);
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Only the verified creator can switch CONVY's model.", message.id);
       return;
     }
     const arg = command.slice("!model".length).trim().toLowerCase();
@@ -1713,6 +1967,17 @@ export class DiscordGateway extends DurableObject {
         await this.ctx.storage.put("gateway_last_error", this.lastError);
         return json({ ok: false, error: this.lastError }, 503);
       }
+    }
+    if (path === "/control/status") {
+      return json({ ok: true, paused: Boolean(await this.ctx.storage.get("convx_paused")), changedAt: await this.ctx.storage.get("convx_pause_changed_at") || null });
+    }
+    if (path === "/control/pause" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      if (String(body.userId || "") !== CONVY_CREATOR_USER_ID) return json({ ok: false, error: "Only the verified creator can use the pause switch." }, 403);
+      await this.ctx.storage.put("convx_paused", Boolean(body.paused));
+      await this.ctx.storage.put("convx_pause_changed_at", Date.now());
+      return json({ ok: true, paused: Boolean(body.paused), changedAt: Date.now() });
     }
     if (path === "/status") {
       return json({
