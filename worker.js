@@ -17,7 +17,7 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r10";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r11";
 const CONVY_RELEASE_NOTES = [
   "Added recent channel conversation context, saved CONVY replies, and owner-approved long-term memories.",
   "Added creator-only pause/resume, persistent runtime settings, web search, and public Discord profile inspection.",
@@ -103,6 +103,17 @@ async function gatewayControl(env, path, options = {}) {
 async function botIsPaused(env) {
   const state = await gatewayControl(env, "/control/status");
   return Boolean(state.paused);
+}
+async function appendConversationMessage(env, message) {
+  if (!message?.id || !message?.channel_id || !message?.author?.id || !String(message.content || "").trim()) return;
+  const row = {
+    id: String(message.id), channel_id: String(message.channel_id), author_id: String(message.author.id),
+    author_name: String(message.member?.nick || message.author.global_name || message.author.username || "Discord user").slice(0, 80),
+    content: String(message.content || "").slice(0, 1200),
+    created_at: String(message.timestamp || new Date().toISOString()),
+    message_url: "https://discord.com/channels/" + String(message.guild_id || "@me") + "/" + String(message.channel_id) + "/" + String(message.id)
+  };
+  await gatewayControl(env, "/context/add", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(row) });
 }
 async function setBotPaused(env, paused, userId) {
   return gatewayControl(env, "/control/pause", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ paused: Boolean(paused), userId: String(userId || "") }) });
@@ -211,8 +222,10 @@ async function sendReply(env, channelId, content, replyTo, mentionTargets = null
       })
     });
     if (first) firstSent = sent;
+    try { await appendConversationMessage(env, sent); }
+    catch (error) { console.log("Bot reply short-context write skipped: " + String(error.message || error).slice(0, 100)); }
     try { if (env.DB) await saveMessage(env, env.DB, sent); }
-    catch (error) { console.log("Bot reply context write skipped: " + String(error.message || error).slice(0, 100)); }
+    catch (error) { console.log("Bot reply D1 history write skipped: " + String(error.message || error).slice(0, 100)); }
   }
   return firstSent;
 }
@@ -311,10 +324,14 @@ async function searchContext(db, channelId, query, excludeMessageId = "", botUse
   const terms = termsFor(query);
   let knowledge = [];
   if (terms.length) {
-    const where = terms.map(() => "(lower(question) LIKE ? OR lower(answer) LIKE ? OR lower(tags) LIKE ?)").join(" OR ");
-    const params = terms.flatMap(term => ["%" + term + "%", "%" + term + "%", "%" + term + "%"]);
-    const result = await db.prepare("SELECT id,question,answer,tags FROM knowledge WHERE " + where + " ORDER BY updated_at DESC LIMIT 6").bind(...params).all();
-    knowledge = result.results || [];
+    try {
+      const where = terms.map(() => "(lower(question) LIKE ? OR lower(answer) LIKE ? OR lower(tags) LIKE ?)").join(" OR ");
+      const params = terms.flatMap(term => ["%" + term + "%", "%" + term + "%", "%" + term + "%"]);
+      const result = await db.prepare("SELECT id,question,answer,tags FROM knowledge WHERE " + where + " ORDER BY updated_at DESC LIMIT 6").bind(...params).all();
+      knowledge = result.results || [];
+    } catch (error) {
+      console.log("Approved knowledge lookup skipped: " + String(error.message || error).slice(0, 120));
+    }
   }
   let messages = [];
   try {
@@ -322,7 +339,7 @@ async function searchContext(db, channelId, query, excludeMessageId = "", botUse
       .bind(String(channelId), String(excludeMessageId || "")).all();
     messages = (result.results || []).reverse();
   } catch (error) {
-    console.log("Recent conversation context unavailable: " + String(error.message || error).slice(0, 120));
+    console.log("Recent D1 conversation fallback unavailable: " + String(error.message || error).slice(0, 120));
   }
   let ownerMemories = [];
   try {
@@ -972,7 +989,14 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
     recentImageMatch = await findRecentImageMessage(env, sourceMessage);
   }
   const contextualQuery = referenced ? String(query || "") + "\n" + referenced.content : query;
-  const context = await searchContext(db, channelId, contextualQuery, sourceMessage?.id, env.BOT_USER_ID), clean = normalize(query);
+  const context = await searchContext(db, channelId, contextualQuery, sourceMessage?.id, env.BOT_USER_ID);
+  try {
+    const recent = await gatewayControl(env, "/context/read?channel_id=" + encodeURIComponent(String(channelId)));
+    if (Array.isArray(recent.messages) && recent.messages.length) context.messages = recent.messages;
+  } catch (error) {
+    console.log("Durable short context lookup skipped; using D1 fallback: " + String(error.message || error).slice(0, 100));
+  }
+  const clean = normalize(query);
   let webResults = [];
   let webSearchError = "";
   const webSearchEnabled = (await setting(db, "web_search_enabled")) !== "off";
@@ -981,7 +1005,7 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
     catch (error) { webSearchError = String(error.message || error).slice(0, 180); }
   }
   const direct = (context.knowledge || []).find(x => normalize(x.question) === clean);
-  if (direct && !referenced) {
+  if (direct && !referenced && !options.forceWebSearch && !wantsWebSearch(query)) {
     return "**From the approved Convx notes:**\n" + direct.answer + "\n\n*Knowledge entry #" + direct.id + "*";
   }
   const kb = (context.knowledge || []).map(x =>
@@ -1495,8 +1519,15 @@ async function handleMention(env, message) {
       await sendUserReply(env, message, "Context diagnostics are creator-only.", message.id);
       return;
     }
-    const rows = await env.DB.prepare("SELECT author_id,author_name,content,created_at FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT 14").bind(message.channel_id).all();
-    const items = (rows.results || []).reverse();
+    let items = [];
+    try {
+      const recent = await gatewayControl(env, "/context/read?channel_id=" + encodeURIComponent(String(message.channel_id)));
+      if (Array.isArray(recent.messages)) items = recent.messages;
+    } catch {}
+    if (!items.length) {
+      const rows = await env.DB.prepare("SELECT message_id AS id,author_id,author_name,content,created_at FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT 14").bind(message.channel_id).all();
+      items = (rows.results || []).reverse();
+    }
     const transcript = items.map(row => "[" + row.created_at + "] " + (String(row.author_id) === String(env.BOT_USER_ID) ? "CONVY" : row.author_name) + ": " + String(row.content || "").slice(0, 190)).join("\n");
     await sendUserReply(env, message, "**Recent context (" + items.length + " messages)**\n" + (transcript || "(none saved yet)"), message.id);
     return;
@@ -1968,6 +1999,36 @@ export class DiscordGateway extends DurableObject {
         return json({ ok: false, error: this.lastError }, 503);
       }
     }
+    if (path === "/context/read" && request.method === "GET") {
+      const channelId = String(new URL(request.url).searchParams.get("channel_id") || "");
+      if (!/^\d{15,22}$/.test(channelId)) return json({ ok: false, error: "A valid channel_id is required." }, 400);
+      const messages = (await this.ctx.storage.get("recent_context:" + channelId)) || [];
+      return json({ ok: true, messages: messages.slice(-14) });
+    }
+    if (path === "/context/add" && request.method === "POST") {
+      let row = {};
+      try { row = await request.json(); } catch {}
+      if (!/^\d{15,22}$/.test(String(row.channel_id || "")) || !/^\d{15,22}$/.test(String(row.id || "")) || !/^\d{15,22}$/.test(String(row.author_id || ""))) {
+        return json({ ok: false, error: "Invalid message context payload." }, 400);
+      }
+      const key = "recent_context:" + String(row.channel_id);
+      const list = (await this.ctx.storage.get(key)) || [];
+      if (!list.some(item => String(item.id) === String(row.id))) {
+        list.push({
+          id: String(row.id), channel_id: String(row.channel_id), author_id: String(row.author_id),
+          author_name: String(row.author_name || "Discord user").slice(0, 80),
+          content: String(row.content || "").slice(0, 1200),
+          created_at: String(row.created_at || new Date().toISOString()),
+          message_url: String(row.message_url || "").slice(0, 500)
+        });
+      }
+      list.sort((a, b) => {
+        try { const aa = BigInt(a.id), bb = BigInt(b.id); return aa < bb ? -1 : aa > bb ? 1 : 0; }
+        catch { return String(a.created_at).localeCompare(String(b.created_at)); }
+      });
+      await this.ctx.storage.put(key, list.slice(-24));
+      return json({ ok: true, count: Math.min(24, list.length) });
+    }
     if (path === "/control/status") {
       return json({ ok: true, paused: Boolean(await this.ctx.storage.get("convx_paused")), changedAt: await this.ctx.storage.get("convx_pause_changed_at") || null });
     }
@@ -2195,8 +2256,32 @@ export class DiscordGateway extends DurableObject {
     }
   }
 
+  async appendRecentContext(message) {
+    if (!message?.id || !message?.channel_id || !message?.author?.id || !String(message.content || "").trim()) return;
+    const key = "recent_context:" + String(message.channel_id);
+    const list = (await this.ctx.storage.get(key)) || [];
+    const row = {
+      id: String(message.id), channel_id: String(message.channel_id), author_id: String(message.author.id),
+      author_name: String(message.member?.nick || message.author.global_name || message.author.username || "Discord user").slice(0, 80),
+      content: String(message.content || "").slice(0, 1200),
+      created_at: String(message.timestamp || new Date().toISOString()),
+      message_url: "https://discord.com/channels/" + String(message.guild_id || "@me") + "/" + String(message.channel_id) + "/" + String(message.id)
+    };
+    if (!list.some(item => String(item.id) === row.id)) list.push(row);
+    list.sort((a, b) => {
+      try { const aa = BigInt(a.id), bb = BigInt(b.id); return aa < bb ? -1 : aa > bb ? 1 : 0; }
+      catch { return String(a.created_at).localeCompare(String(b.created_at)); }
+    });
+    await this.ctx.storage.put(key, list.slice(-24));
+  }
+
   async processMessage(message) {
-    if (!message || message.guild_id !== String(this.env.GUILD_ID || "") || message.author?.bot) return;
+    if (!message || message.guild_id !== String(this.env.GUILD_ID || "")) return;
+    const isOwnBotMessage = Boolean(message.author?.bot && String(message.author.id) === String(this.env.BOT_USER_ID || ""));
+    if (message.author?.bot && !isOwnBotMessage) return;
+    try { await this.appendRecentContext(message); }
+    catch (error) { console.log("Durable recent context append skipped: " + String(error.message || error).slice(0, 120)); }
+    if (isOwnBotMessage) return;
     const mentioned = isBotMention(this.env, message);
     // Replying directly to a CONVY message is an implicit address, even without @mention.
     const repliedToBot = !mentioned && await isReplyToBot(this.env, message);
