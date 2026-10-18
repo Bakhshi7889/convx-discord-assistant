@@ -1178,7 +1178,9 @@ export class DiscordGateway extends DurableObject {
       if (this.socket !== ws) return;
       this.socket = null;
       this.clearHeartbeat();
-      this.lastError = "WebSocket closed (" + event.code + ")";
+      this.lastError = event.code === 4014
+        ? "Discord rejected a privileged Gateway intent (4014). Enable Message Content Intent in the Discord Developer Portal."
+        : "WebSocket closed (" + event.code + ")";
       this.ctx.waitUntil(this.ctx.storage.put("gateway_last_error", this.lastError));
       this.scheduleReconnect();
     });
@@ -1286,6 +1288,7 @@ export class DiscordGateway extends DurableObject {
       return;
     }
     if (packet.op === 1) {
+      this.heartbeatAck = false;
       try { ws.send(JSON.stringify({ op: 1, d: this.sequence })); }
       catch { try { ws.close(4000, "server heartbeat request failed"); } catch {} }
       return;
