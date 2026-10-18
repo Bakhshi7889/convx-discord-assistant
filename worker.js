@@ -2,6 +2,11 @@ import { DurableObject } from "cloudflare:workers";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
+const OPENROUTER_API = "https://openrouter.ai/api/v1";
+const DEFAULT_PRIMARY_MODEL_PROVIDER = "openrouter";
+const DEFAULT_OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free";
+const OPENROUTER_MODEL_CHECK_CACHE_MS = 15 * 60 * 1000;
+const OPENROUTER_REQUEST_TIMEOUT_MS = 12000;
 // Lazy-refresh the shared Pollinations catalog hourly in Durable Object storage, never D1.
 const MODEL_CACHE_MS = 60 * 60 * 1000;
 const MODEL_CATALOG_SCHEMA_VERSION = 5;
@@ -28,14 +33,24 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r20";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r21";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Set preferred free community text-model order to Gemma Diffusion 26B, Jimmy, Laguna S 2.1, Muse Glimmer 30B, and GPT OSS 120B, matching the creator's specified ranking.",
-  "Make preferred-model numbering and alternative-model choices dynamic so !model 1-5 select the ranked list and !model 6-15 select other eligible green models.",
-  "Separate vision-capable model IDs from preferred rank so text-only ranks do not become image-routing candidates.",
-  "Bump the catalog schema to force a fresh verified catalog after the preferred model list changes; no D1 catalog writes added."
+  "Add OpenRouter as the configurable primary chat provider using liquid/lfm-2.5-2.6b:free, with live zero-pricing verification before requests.",
+  "Retry transient OpenRouter failures once, then fall back to the existing verified free Pollinations model route; explicit !model overrides and image requests continue through Pollinations.",
+  "Record provider, model, latency, HTTP failure status, token usage, and cached-token usage when OpenRouter returns it, without logging prompts or credentials.",
+  "Keep provider model-price verification in Durable Object storage rather than D1 and expose only whether the OpenRouter secret is configured."
 ];
 const CONVY_RELEASE_HISTORY = [
+  {
+    version: "convx-2026-10-18-r20",
+    appliedAt: "2026-10-18T18:11:17.636972Z",
+    commit: "c0e5d85232915d8f73e592ce5b8568e2f8147aa5",
+    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39152956905",
+    changes: [
+      "Rank the five requested Pollinations fallback models in screenshot order.",
+      "Calculate alternative-model numbering dynamically and separate vision capability from preferred-model rank."
+    ]
+  },
   {
     version: "convx-2026-10-18-r19",
     appliedAt: "2026-10-18T18:02:13.192561Z",
@@ -1034,7 +1049,9 @@ function withRuntimeSnapshot(env, messages, modelId, settings, hasImages, tuning
     "Build metadata:\n" + buildMetadataText(env, false),
     "Actual model handling this attempt: " + modelId,
     "Owner-selected model override: " + (ownerSelectedId || "AUTO (preferred order)"),
-    "Preferred model order: " + PREFERRED_MODEL_ORDER.join(" -> "),
+    "Configured primary provider: " + String(env.PRIMARY_MODEL_PROVIDER || DEFAULT_PRIMARY_MODEL_PROVIDER),
+    "Configured OpenRouter model: " + String(env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL),
+    "Pollinations fallback order: " + PREFERRED_MODEL_ORDER.join(" -> "),
     "Images included in this request: " + (hasImages ? "yes" : "no"),
     "Response settings currently applied: " + JSON.stringify(settings),
     "Per-reply setting adjustment tool available: " + (tuningEnabled ? "yes, adjust_response_settings" : "no"),
@@ -1049,7 +1066,7 @@ function withRuntimeSnapshot(env, messages, modelId, settings, hasImages, tuning
   });
 }
 
-async function callFreeModel(env,db,messages,maxTokens=550) {
+async function callPollinationsModel(env,db,messages,maxTokens=550) {
   if (!env.POLLINATIONS_API_KEY) throw new Error("Pollinations API key is not configured yet.");
   const catalog = await models(env);
   if (catalog.stale) {
@@ -1241,6 +1258,376 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
   }
   throw new Error("The top " + attempts + " eligible, non-down community models failed. Last failure: " + lastFailure + ". No paid model was attempted.");
 }
+
+function configuredPrimaryProvider(env) {
+  return String(env.PRIMARY_MODEL_PROVIDER || DEFAULT_PRIMARY_MODEL_PROVIDER).trim().toLowerCase();
+}
+
+function configuredOpenRouterModel(env) {
+  return String(env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL).trim();
+}
+
+async function saveOpenRouterModelStatus(env, status) {
+  try {
+    await gatewayControl(env, "/providers/openrouter/model-status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(status)
+    });
+  } catch (error) {
+    console.log("OpenRouter model-status cache write skipped: " + String(error.message || error).slice(0, 100));
+  }
+}
+
+async function verifyOpenRouterFreeModel(env, modelId) {
+  if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not configured in the Cloudflare Worker.");
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.:-]+$/i.test(modelId) || !modelId.toLowerCase().endsWith(":free")) {
+    throw new Error("The configured OpenRouter model must be an explicit :free model ID.");
+  }
+
+  const now = Date.now();
+  let cached = null;
+  try {
+    const result = await gatewayControl(env, "/providers/openrouter/model-status?model=" + encodeURIComponent(modelId));
+    cached = result?.status || null;
+  } catch {}
+  if (cached && cached.modelId === modelId && Number(cached.checkedAt) > 0) {
+    const age = now - Number(cached.checkedAt);
+    const ttl = cached.verified === true ? OPENROUTER_MODEL_CHECK_CACHE_MS : 60 * 1000;
+    if (age >= 0 && age < ttl) {
+      if (cached.verified) return cached;
+      throw new Error(String(cached.reason || "OpenRouter model pricing was not verified as free."));
+    }
+  }
+
+  const failStatus = async reason => {
+    const status = { modelId, checkedAt: Date.now(), verified: false, reason: String(reason).slice(0, 180) };
+    await saveOpenRouterModelStatus(env, status);
+    throw new Error(status.reason);
+  };
+
+  const path = modelId.split("/").map(encodeURIComponent).join("/");
+  let response;
+  try {
+    response = await fetch(OPENROUTER_API + "/model/" + path, {
+      headers: { "Authorization": "Bearer " + env.OPENROUTER_API_KEY, "Accept": "application/json" },
+      signal: AbortSignal.timeout(6500)
+    });
+  } catch {
+    throw new Error("OpenRouter model-price verification failed or timed out; no OpenRouter inference request was sent.");
+  }
+  if (!response.ok) return failStatus("OpenRouter model verification returned HTTP " + response.status + ".");
+  let payload;
+  try { payload = await response.json(); }
+  catch { return failStatus("OpenRouter returned unreadable model metadata."); }
+
+  const info = payload?.data || payload;
+  const pricing = info?.pricing;
+  const knownZero = value => value !== undefined && value !== null && value !== "" &&
+    Number.isFinite(Number(value)) && Number(value) === 0;
+  if (String(info?.id || "") !== modelId) return failStatus("OpenRouter metadata did not match the configured model ID.");
+  if (!pricing || !knownZero(pricing.prompt) || !knownZero(pricing.completion)) {
+    return failStatus("OpenRouter's live catalog did not confirm numeric zero input and output prices.");
+  }
+  for (const [key, value] of Object.entries(pricing)) {
+    if (!/(prompt|completion|request|price|cost|image|audio|video|cache|reasoning|web|file|input|output|token)/i.test(key)) continue;
+    if (value === undefined || value === null || value === "") continue;
+    if (!Number.isFinite(Number(value)) || Number(value) !== 0) {
+      return failStatus("OpenRouter catalog advertises a nonzero or unparseable " + key + " price.");
+    }
+  }
+  const inputModalities = info?.architecture?.input_modalities;
+  const outputModalities = info?.architecture?.output_modalities;
+  if (!Array.isArray(inputModalities) || !inputModalities.includes("text") ||
+      !Array.isArray(outputModalities) || !outputModalities.includes("text")) {
+    return failStatus("OpenRouter metadata did not confirm text input and text output support.");
+  }
+
+  const status = {
+    modelId,
+    checkedAt: Date.now(),
+    verified: true,
+    inputPrice: 0,
+    outputPrice: 0,
+    contextLength: Math.max(0, Number(info.context_length) || 0),
+    reason: ""
+  };
+  await saveOpenRouterModelStatus(env, status);
+  return status;
+}
+
+function parseOpenRouterTuningArgs(raw, current, locked = {}) {
+  let args;
+  try { args = typeof raw === "string" ? JSON.parse(raw) : raw; }
+  catch { return { settings: current, result: { ok: false, error: "Settings were not valid JSON; current settings unchanged." } }; }
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return { settings: current, result: { ok: false, error: "Expected an object; current settings unchanged." } };
+  }
+  const asksReasoning = args.reasoning_effort !== undefined;
+  const supported = { ...args };
+  delete supported.reasoning_effort;
+  const result = safeTuningArgs(supported, current, locked);
+  if (asksReasoning) {
+    if (result.result.ok) result.result.warning = "reasoning_effort remains provider-managed on OpenRouter; temperature/max_tokens changes were applied.";
+    else result.result.error = "OpenRouter keeps reasoning_effort provider-managed. " + String(result.result.error || "No supported setting was changed.");
+  }
+  return result;
+}
+
+function openRouterUsage(data) {
+  const usage = data?.usage || {};
+  const prompt = Number(usage.prompt_tokens ?? usage.input_tokens);
+  const completion = Number(usage.completion_tokens ?? usage.output_tokens);
+  const cached = Number(
+    usage.prompt_tokens_details?.cached_tokens ??
+    usage.input_tokens_details?.cached_tokens ??
+    usage.prompt_cache_hit_tokens ??
+    usage.cache_read_input_tokens
+  );
+  return {
+    promptTokens: Number.isFinite(prompt) ? prompt : null,
+    completionTokens: Number.isFinite(completion) ? completion : null,
+    cachedPromptTokens: Number.isFinite(cached) ? cached : null,
+    totalTokens: Number.isFinite(Number(usage.total_tokens)) ? Number(usage.total_tokens) : null
+  };
+}
+
+function openRouterErrorDetail(value) {
+  return String(value || "").replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").slice(0, 170);
+}
+
+async function openRouterCompletion(env, modelId, messages, settings, ownerSelectedId, useTools) {
+  const requestMessages = withRuntimeSnapshot(env, messages, modelId, settings, false, Boolean(useTools), ownerSelectedId);
+  const body = {
+    model: modelId,
+    messages: requestMessages,
+    temperature: settings.temperature,
+    max_tokens: settings.max_tokens,
+    ...(useTools ? { tools: RESPONSE_SETTINGS_TOOL, tool_choice: "auto" } : {})
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let response;
+    try {
+      response = await fetch(OPENROUTER_API + "/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + env.OPENROUTER_API_KEY,
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "HTTP-Referer": "https://github.com/Bakhshi7889/convx-discord-assistant",
+          "X-Title": "CONVY Discord Assistant"
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(OPENROUTER_REQUEST_TIMEOUT_MS)
+      });
+    } catch {
+      if (attempt < 2) {
+        console.log(JSON.stringify({ event: "openrouter_retry", model: modelId, reason: "network_or_timeout", attempt }));
+        await new Promise(resolve => setTimeout(resolve, 450));
+        continue;
+      }
+      const failure = new Error("OpenRouter network request failed or timed out after one bounded retry.");
+      failure.status = 0;
+      throw failure;
+    }
+
+    if ([408, 429, 500, 502, 503, 504].includes(response.status) && attempt < 2) {
+      let delay = Number(response.headers.get("retry-after")) * 1000;
+      if (!Number.isFinite(delay) || delay <= 0) delay = 450;
+      delay = Math.max(150, Math.min(800, delay));
+      console.log(JSON.stringify({ event: "openrouter_retry", model: modelId, status: response.status, attempt }));
+      await new Promise(resolve => setTimeout(resolve, delay));
+      continue;
+    }
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const payload = await response.json();
+        detail = payload?.error?.message || payload?.message || "";
+      } catch {}
+      const failure = new Error("OpenRouter returned HTTP " + response.status + (detail ? ": " + openRouterErrorDetail(detail) : ""));
+      failure.status = response.status;
+      throw failure;
+    }
+
+    let payload;
+    try { payload = await response.json(); }
+    catch {
+      const failure = new Error("OpenRouter returned an invalid JSON completion response.");
+      failure.status = 200;
+      throw failure;
+    }
+    if (payload?.error) {
+      const failure = new Error("OpenRouter returned a provider error: " + openRouterErrorDetail(payload.error.message || payload.error));
+      failure.status = Number(payload.error.code) || 502;
+      throw failure;
+    }
+    return { data: payload, requestAttempt: attempt };
+  }
+
+  const failure = new Error("OpenRouter request failed after the bounded retry.");
+  failure.status = 503;
+  throw failure;
+}
+
+async function callOpenRouterPrimary(env, db, messages, maxTokens = 550) {
+  const modelId = configuredOpenRouterModel(env);
+  const hasImages = messages.some(message =>
+    Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
+  );
+  if (hasImages) throw new Error("The configured OpenRouter primary is text-only; image requests use the existing Pollinations vision fallback.");
+  const started = Date.now();
+  let recorded = false;
+  try {
+    const verification = await verifyOpenRouterFreeModel(env, modelId);
+    const ownerSelectedId = await setting(db, "owner_selected_model_id");
+    const configuredReasoning = await setting(db, "reasoning_override");
+    const configuredTemperature = await setting(db, "temperature_override");
+    const configuredMaxTokens = await setting(db, "max_tokens_override");
+    const lockedSettings = {};
+    if (["low", "medium", "high"].includes(String(configuredReasoning || ""))) lockedSettings.reasoning_effort = String(configuredReasoning);
+    if (configuredTemperature !== null && configuredTemperature !== "" && Number.isFinite(Number(configuredTemperature)) && Number(configuredTemperature) >= 0 && Number(configuredTemperature) <= 1) lockedSettings.temperature = Number(configuredTemperature);
+    if (configuredMaxTokens !== null && configuredMaxTokens !== "" && Number.isInteger(Number(configuredMaxTokens)) && Number(configuredMaxTokens) >= 100 && Number(configuredMaxTokens) <= 900) lockedSettings.max_tokens = Number(configuredMaxTokens);
+
+    const query = requestText(messages);
+    const initialSettings = { ...initialResponseSettings(query, maxTokens, false), ...lockedSettings };
+    const currentSettings = {
+      temperature: initialSettings.temperature,
+      max_tokens: initialSettings.max_tokens
+    };
+    let conversation = [...messages];
+    let totalUsage = { promptTokens: null, completionTokens: null, cachedPromptTokens: null, totalTokens: null };
+    const absorbUsage = data => {
+      const usage = openRouterUsage(data);
+      for (const key of Object.keys(totalUsage)) {
+        if (usage[key] !== null) totalUsage[key] = (totalUsage[key] === null ? 0 : totalUsage[key]) + usage[key];
+      }
+    };
+
+    let result = await openRouterCompletion(env, modelId, conversation, currentSettings, ownerSelectedId, true);
+    absorbUsage(result.data);
+    let assistantMessage = result.data.choices?.[0]?.message;
+    const toolCalls = Array.isArray(assistantMessage?.tool_calls) ? assistantMessage.tool_calls : [];
+    if (toolCalls.length) {
+      conversation.push({
+        role: "assistant",
+        content: assistantMessage.content || null,
+        tool_calls: toolCalls
+      });
+      const acceptedCalls = toolCalls.slice(0, 1);
+      for (const toolCall of toolCalls) {
+        let toolResult;
+        if (toolCall === acceptedCalls[0] && toolCall?.function?.name === "adjust_response_settings") {
+          const applied = parseOpenRouterTuningArgs(toolCall.function.arguments, currentSettings, {
+            temperature: lockedSettings.temperature,
+            max_tokens: lockedSettings.max_tokens
+          });
+          currentSettings.temperature = applied.settings.temperature;
+          currentSettings.max_tokens = applied.settings.max_tokens;
+          toolResult = applied.result;
+        } else {
+          toolResult = { ok: false, error: "Only one local adjust_response_settings call is allowed per reply." };
+        }
+        conversation.push({
+          role: "tool",
+          tool_call_id: String(toolCall.id || "settings-tool"),
+          content: JSON.stringify(toolResult)
+        });
+      }
+      result = await openRouterCompletion(env, modelId, conversation, currentSettings, ownerSelectedId, false);
+      absorbUsage(result.data);
+      assistantMessage = result.data.choices?.[0]?.message;
+    }
+
+    const rawAnswer = assistantMessage?.content;
+    const answer = typeof rawAnswer === "string"
+      ? rawAnswer.trim()
+      : Array.isArray(rawAnswer)
+        ? rawAnswer.filter(part => part?.type === "text" && part.text).map(part => String(part.text)).join("").trim()
+        : "";
+    if (!answer) {
+      const failure = new Error("OpenRouter returned an empty answer.");
+      failure.status = 502;
+      throw failure;
+    }
+
+    const elapsed = Date.now() - started;
+    await recordModelResult(env, modelId, elapsed, true);
+    recorded = true;
+    const usage = Object.values(totalUsage).some(value => value !== null) ? totalUsage : openRouterUsage(result.data);
+    console.log(JSON.stringify({
+      event: "model_request",
+      provider: "openrouter",
+      model: modelId,
+      outcome: "success",
+      latency_ms: elapsed,
+      retry_count: Math.max(0, Number(result.requestAttempt || 1) - 1),
+      prompt_tokens: usage.promptTokens,
+      completion_tokens: usage.completionTokens,
+      cached_prompt_tokens: usage.cachedPromptTokens,
+      total_tokens: usage.totalTokens,
+      catalog_verified_free: verification.verified === true
+    }));
+    return {
+      content: answer,
+      modelId,
+      provider: "openrouter",
+      usage,
+      settings: { ...currentSettings, reasoning_effort: initialSettings.reasoning_effort },
+      buildVersion: CONVY_BUILD_VERSION
+    };
+  } catch (error) {
+    if (!recorded) {
+      try { await recordModelResult(env, modelId, Date.now() - started, false); } catch {}
+    }
+    console.log(JSON.stringify({
+      event: "model_request",
+      provider: "openrouter",
+      model: modelId,
+      outcome: "failure",
+      latency_ms: Date.now() - started,
+      http_status: Number(error?.status) || null,
+      error: openRouterErrorDetail(error?.message || error)
+    }));
+    throw error;
+  }
+}
+
+async function callFreeModel(env, db, messages, maxTokens = 550) {
+  const provider = configuredPrimaryProvider(env);
+  const selectedOverride = await setting(db, "owner_selected_model_id");
+  const hasImages = messages.some(message =>
+    Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
+  );
+
+  // Explicit !model selections retain their existing meaning and route through Pollinations.
+  if (provider === "openrouter" && !selectedOverride && !hasImages) {
+    if (!env.OPENROUTER_API_KEY) {
+      console.log("OpenRouter primary is not configured: OPENROUTER_API_KEY is missing. Trying configured Pollinations fallbacks.");
+    } else {
+      try {
+        return await callOpenRouterPrimary(env, db, messages, maxTokens);
+      } catch (error) {
+        console.log("OpenRouter primary failed; trying configured Pollinations fallbacks: " + openRouterErrorDetail(error?.message || error));
+      }
+    }
+    try {
+      const fallback = await callPollinationsModel(env, db, messages, maxTokens);
+      return { ...fallback, fallbackFrom: "openrouter/" + configuredOpenRouterModel(env) };
+    } catch (error) {
+      throw new Error("OpenRouter primary was unavailable (" +
+        (env.OPENROUTER_API_KEY ? "request or free-pricing verification failed" : "OPENROUTER_API_KEY is not configured") +
+        "); the existing Pollinations fallback also failed: " + openRouterErrorDetail(error?.message || error));
+    }
+  }
+
+  if (provider !== "openrouter" && provider !== "pollinations") {
+    console.log("Unknown PRIMARY_MODEL_PROVIDER value; using the existing Pollinations fallback. provider=" + provider.slice(0, 40));
+  }
+  return callPollinationsModel(env, db, messages, maxTokens);
+}
+
 async function fetchReferencedMessage(env, db, sourceMessage) {
   const reference = sourceMessage?.message_reference || sourceMessage?.reference || null;
   if (!reference?.message_id) return null;
@@ -1956,7 +2343,8 @@ async function handleMention(env, message) {
     const content = "**CONVY runtime snapshot**\n" +
       buildMetadataText(env, false) + "\n" +
       "**Last successful model:** " + preferred + "\n" +
-      "**Routing order:** " + PREFERRED_MODEL_ORDER.join(" → ") + "\n" +
+      "**Primary provider:** " + configuredPrimaryProvider(env) + " · model " + configuredOpenRouterModel(env) + " · API key configured: " + Boolean(env.OPENROUTER_API_KEY) + "\n" +
+      "**Pollinations fallback order:** " + PREFERRED_MODEL_ORDER.join(" → ") + "\n" +
       "**Self-tuning:** explicitly designated settings-capable models may adjust reasoning effort, temperature, and output-token budget for one reply only. Nothing persists and no model can override the routing order.\n" +
       "**Creator/maintainer:** <@" + CONVY_CREATOR_USER_ID + ">\n" +
       "**Changes in this release:**\n" + CONVY_CURRENT_RELEASE_NOTES.map((note, index) => (index + 1) + ". " + note).join("\n") + "\n\n**Known capabilities:**\n" + notes;
@@ -2457,6 +2845,33 @@ export class DiscordGateway extends DurableObject {
         return json({ ok: false, error: String(error.message || error).slice(0, 140) }, 500);
       }
     }
+    if (path === "/providers/openrouter/model-status" && request.method === "GET") {
+      const modelId = String(new URL(request.url).searchParams.get("model") || "");
+      if (!/^[a-z0-9_.-]+\/[a-z0-9_.:-]+$/i.test(modelId) || modelId.length > 200) {
+        return json({ ok: false, error: "A valid OpenRouter model ID is required." }, 400);
+      }
+      const status = await this.ctx.storage.get("openrouter_model_status:" + modelId) || null;
+      return json({ ok: true, status });
+    }
+    if (path === "/providers/openrouter/model-status" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      const modelId = String(body.modelId || "");
+      if (!/^[a-z0-9_.-]+\/[a-z0-9_.:-]+$/i.test(modelId) || modelId.length > 200) {
+        return json({ ok: false, error: "A valid OpenRouter model ID is required." }, 400);
+      }
+      const status = {
+        modelId,
+        checkedAt: Math.max(0, Number(body.checkedAt) || Date.now()),
+        verified: body.verified === true,
+        inputPrice: body.inputPrice === undefined ? null : Number(body.inputPrice),
+        outputPrice: body.outputPrice === undefined ? null : Number(body.outputPrice),
+        contextLength: Math.max(0, Number(body.contextLength) || 0),
+        reason: String(body.reason || "").slice(0, 180)
+      };
+      await this.ctx.storage.put("openrouter_model_status:" + modelId, status);
+      return json({ ok: true, status });
+    }
     if (path === "/models/catalog" && request.method === "GET") {
       const snapshot = await this.ctx.storage.get("model_catalog_snapshot") || null;
       return json({ ok: true, snapshot });
@@ -2842,6 +3257,9 @@ export default {
         configured: {
           discordToken: Boolean(env.DISCORD_TOKEN),
           pollinationsKey: Boolean(env.POLLINATIONS_API_KEY),
+          openRouterKey: Boolean(env.OPENROUTER_API_KEY),
+          primaryModelProvider: configuredPrimaryProvider(env),
+          openRouterModel: configuredOpenRouterModel(env),
           channelId: Boolean(env.TARGET_CHANNEL_ID),
           botUserId: Boolean(env.BOT_USER_ID),
           guildId: Boolean(env.GUILD_ID),
