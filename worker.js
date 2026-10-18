@@ -2,8 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
-// Refreshing the full model catalog rewrites many D1 rows. Daily is enough for a free-tier bot.
-const MODEL_CACHE_MS = 24 * 60 * 60 * 1000; // Keep catalog writes comfortably below D1's free daily quota.
+// Lazy-refresh the shared Pollinations catalog hourly in Durable Object storage, never D1.
+const MODEL_CACHE_MS = 60 * 60 * 1000;
 const MODEL_ATTEMPT_LIMIT = 3;
 const MODEL_TIMEOUT_MS = 9000;
 // Explicit first-choice order. Models still must appear in the live catalog as eligible,
@@ -602,7 +602,8 @@ function verifiedFreeTextModel(model) {
   // Agent wrappers can trigger billable child calls even when the wrapper has no text rate.
   if (model.agent === true) return false;
   const id = String(model.id || model.name || "").trim();
-  if (!(model.community === true || id.startsWith("community/"))) return false;
+  const source = String(model.source || "").toLowerCase();
+  if (!(model.community === true || source === "community" || id.startsWith("community/"))) return false;
   if (model.category && String(model.category).toLowerCase() !== "text") return false;
   if (Array.isArray(model.output_modalities) &&
       !model.output_modalities.some(value => String(value).toLowerCase() === "text")) return false;
@@ -687,70 +688,126 @@ function extraGreenModels(pool) {
     .sort((a, b) => modelScore(b) - modelScore(a));
 }
 
-async function models(db, force=false) {
-  const readCached = async () => {
-    const rows = await db.prepare(
-      "SELECT model_id,source,health,success_rate,request_count,avg_latency_ms,local_success_count,local_failure_count FROM models WHERE eligible=1"
-    ).all();
-    return sortModelRows(rows.results || []);
-  };
-  const last = Number(await setting(db, "model_checked_ms") || 0);
-  const filterVersion = await setting(db, "model_filter_version");
-  const cached = await readCached();
-  if (!force && filterVersion === "3" && Date.now() - last < MODEL_CACHE_MS && cached.length) {
-    return cached;
+async function readModelCatalogSnapshot(env) {
+  try {
+    const state = await gatewayControl(env, "/models/catalog");
+    const snapshot = state?.snapshot;
+    return snapshot && Array.isArray(snapshot.models) ? snapshot : null;
+  } catch (error) {
+    console.log("Durable model catalog read skipped: " + String(error.message || error).slice(0, 100));
+    return null;
+  }
+}
+
+async function models(env, force = false) {
+  const now = Date.now();
+  const previous = await readModelCatalogSnapshot(env);
+  const previousModels = Array.isArray(previous?.models) ? previous.models : [];
+  const lastSuccessfulModel = String(previous?.lastSuccessfulModel || "");
+  const checkedAt = Number(previous?.checkedAt || 0);
+
+  // Normal routing uses a one-hour Durable Object snapshot. Explicit !models and !model
+  // requests set force=true to fetch Pollinations live, regardless of snapshot age.
+  if (!force && previousModels.length && checkedAt > 0 &&
+      now >= checkedAt && now - checkedAt < MODEL_CACHE_MS) {
+    return {
+      models: sortModelRows(previousModels),
+      checkedAt,
+      stale: false,
+      lastSuccessfulModel,
+      source: "Durable Object hourly snapshot"
+    };
   }
 
   try {
-    const response = await fetch(POLLINATIONS_API + "/text/models?community=true&reliability=all", {
+    const response = await fetch(POLLINATIONS_API + "/text/models?source=community&reliability=all", {
       headers: { "accept": "application/json" },
       signal: AbortSignal.timeout(10000)
     });
     if (!response.ok) throw new Error("Pollinations model catalog returned HTTP " + response.status);
-    const all = catalogModels(await response.json()), eligible = [];
+
+    const all = catalogModels(await response.json());
+    const eligible = [];
+    const previousById = new Map(previousModels.map(model => [String(model.model_id || model.id || ""), model]));
     for (const model of all) {
       if (!verifiedFreeTextModel(model)) continue;
       const id = String(model.id || model.name || "").trim();
       if (!id) continue;
-      const h = modelHealth(model), source = String(model.source || "community").toLowerCase(), p = modelPrices(model);
-      eligible.push({ id, source, status: h.status, success: h.success, requests: h.requests, input: p.input ?? 0, output: p.output ?? 0 });
+      const h = modelHealth(model);
+      const p = modelPrices(model);
+      const prior = previousById.get(id) || {};
+      eligible.push({
+        model_id: id,
+        source: String(model.source || "community").toLowerCase(),
+        health: h.status,
+        success_rate: h.success,
+        request_count: h.requests,
+        prompt_price: p.input ?? 0,
+        completion_price: p.output ?? 0,
+        avg_latency_ms: Number(prior.avg_latency_ms) || 0,
+        local_success_count: Number(prior.local_success_count) || 0,
+        local_failure_count: Number(prior.local_failure_count) || 0
+      });
     }
-    if (!eligible.length && cached.length) return cached;
 
-    await db.prepare("UPDATE models SET eligible=0").run();
-    for (const m of eligible) {
-      await db.prepare(
-        "INSERT INTO models(model_id,source,prompt_price,completion_price,health,success_rate,request_count,checked_at,eligible) " +
-        "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,1) ON CONFLICT(model_id) DO UPDATE SET " +
-        "source=excluded.source,prompt_price=excluded.prompt_price,completion_price=excluded.completion_price," +
-        "health=excluded.health,success_rate=excluded.success_rate,request_count=excluded.request_count," +
-        "checked_at=CURRENT_TIMESTAMP,eligible=1"
-      ).bind(m.id, m.source, m.input, m.output, m.status, m.success, m.requests).run();
+    if (!eligible.length) {
+      throw new Error("Pollinations returned no models that pass the strict free community text-model filter.");
     }
-    await setSetting(db, "model_filter_version", "3");
-    await setSetting(db, "model_checked_ms", Date.now());
-    const refreshed = await readCached();
-    return refreshed.length ? refreshed : cached;
+
+    const snapshot = {
+      checkedAt: Date.now(),
+      models: eligible,
+      lastSuccessfulModel,
+      lastSuccessfulAt: Number(previous?.lastSuccessfulAt || 0)
+    };
+    try {
+      await gatewayControl(env, "/models/catalog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(snapshot)
+      });
+    } catch (error) {
+      // A live response is still usable for this request, but won't be cached if the DO is down.
+      console.log("Durable model catalog write skipped: " + String(error.message || error).slice(0, 100));
+    }
+
+    return {
+      models: sortModelRows(eligible),
+      checkedAt: snapshot.checkedAt,
+      stale: false,
+      lastSuccessfulModel,
+      source: "live Pollinations community catalog"
+    };
   } catch (error) {
-    if (cached.length) {
-      // D1 row-write limits should not take down chat when a usable free-model cache exists.
-      console.log("Model catalog refresh skipped; using cached free models: " + String(error.message || error).slice(0, 120));
-      return cached;
+    if (previousModels.length) {
+      return {
+        models: sortModelRows(previousModels),
+        checkedAt,
+        stale: true,
+        lastSuccessfulModel,
+        source: "stale Durable Object snapshot",
+        error: String(error.message || error).slice(0, 160)
+      };
     }
     throw error;
   }
 }
-async function recordModelResult(db,id,elapsed,succeeded) {
-  const ms = Math.max(0, Math.round(Number(elapsed) || 0));
-  // Observability is optional. Never let a full D1 quota discard an otherwise valid AI answer.
+
+async function recordModelResult(env, id, elapsed, succeeded) {
+  // Per-attempt metrics live in Durable Object storage so ordinary inference doesn't
+  // spend D1 row writes on telemetry or "last model used" bookkeeping.
   try {
-    await db.prepare(
-      "UPDATE models SET avg_latency_ms=CASE WHEN avg_latency_ms<=0 THEN ? ELSE (avg_latency_ms*0.7+?*0.3) END," +
-      "local_success_count=local_success_count+CASE WHEN ? THEN 1 ELSE 0 END," +
-      "local_failure_count=local_failure_count+CASE WHEN ? THEN 0 ELSE 1 END WHERE model_id=?"
-    ).bind(ms, ms, succeeded ? 1 : 0, succeeded ? 1 : 0, id).run();
+    await gatewayControl(env, "/models/result", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: String(id || ""),
+        elapsed: Math.max(0, Math.round(Number(elapsed) || 0)),
+        succeeded: Boolean(succeeded)
+      })
+    });
   } catch (error) {
-    console.log("Model metrics write skipped: " + String(error.message || error).slice(0, 100));
+    console.log("Durable model metrics write skipped: " + String(error.message || error).slice(0, 100));
   }
 }
 
@@ -824,9 +881,13 @@ function withRuntimeSnapshot(env, messages, modelId, settings, hasImages, tuning
 
 async function callFreeModel(env,db,messages,maxTokens=550) {
   if (!env.POLLINATIONS_API_KEY) throw new Error("Pollinations API key is not configured yet.");
-  const pool = await models(db);
+  const catalog = await models(env);
+  if (catalog.stale) {
+    throw new Error("The live Pollinations free-model catalog could not be verified. No model request was sent because the cached pricing/eligibility data is stale.");
+  }
+  const pool = catalog.models;
   if (!pool.length) {
-    throw new Error("Pollinations returned no eligible community text models with no billed text-token rates. The catalog is cached hourly; paid-only and nonzero-priced models are excluded.");
+    throw new Error("Pollinations returned no eligible free community text models with no billed text-token rates. No paid model was attempted.");
   }
 
   const configuredReasoning = await setting(db, "reasoning_override");
@@ -903,7 +964,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
 
       let response = await postCompletion(conversation, true);
       if (response.status === 402) {
-        await recordModelResult(db, id, Date.now() - started, false);
+        await recordModelResult(env, id, Date.now() - started, false);
         recorded = true;
         lastFailure = id + " returned HTTP 402 (payment required); skipping it without attempting any paid fallback.";
         continue;
@@ -911,7 +972,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
       if (!response.ok) {
         let detail = "";
         try { detail = (await response.text()).slice(0, 90).replace(/[\r\n]+/g, " "); } catch {}
-        await recordModelResult(db, id, Date.now() - started, false);
+        await recordModelResult(env, id, Date.now() - started, false);
         recorded = true;
         lastFailure = id + " returned HTTP " + response.status + (detail ? ": " + detail : "");
         continue;
@@ -971,7 +1032,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
           signal: AbortSignal.timeout(MODEL_TIMEOUT_MS)
         });
         if (response.status === 402) {
-          await recordModelResult(db, id, Date.now() - started, false);
+          await recordModelResult(env, id, Date.now() - started, false);
           recorded = true;
           lastFailure = id + " returned HTTP 402 on the tuned reply; skipping it without attempting any paid fallback.";
           continue;
@@ -979,7 +1040,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
         if (!response.ok) {
           let detail = "";
           try { detail = (await response.text()).slice(0, 90).replace(/[\r\n]+/g, " "); } catch {}
-          await recordModelResult(db, id, Date.now() - started, false);
+          await recordModelResult(env, id, Date.now() - started, false);
           recorded = true;
           lastFailure = id + " returned HTTP " + response.status + " after a settings adjustment" + (detail ? ": " + detail : "");
           continue;
@@ -990,15 +1051,9 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
 
       const answer = assistantMessage?.content;
       const succeeded = typeof answer === "string" && Boolean(answer.trim());
-      await recordModelResult(db, id, Date.now() - started, succeeded);
+      await recordModelResult(env, id, Date.now() - started, succeeded);
       recorded = true;
       if (succeeded) {
-        try {
-          await setSetting(db, "preferred_model_id", id);
-          await setSetting(db, "preferred_model_last_success_ms", Date.now());
-        } catch (error) {
-          console.log("Preferred-model metadata write skipped: " + String(error.message || error).slice(0, 100));
-        }
         return {
           content: answer.trim(),
           modelId: id,
@@ -1009,7 +1064,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
       lastFailure = id + " returned an empty answer.";
     } catch (error) {
       if (!recorded) {
-        try { await recordModelResult(db, id, Date.now() - started, false); } catch {}
+        try { await recordModelResult(env, id, Date.now() - started, false); } catch {}
       }
       lastFailure = id + " failed or timed out: " + String(error?.message || error).slice(0, 110);
     }
@@ -1721,7 +1776,8 @@ async function handleMention(env, message) {
       await sendUserReply(env, message, "Nope. !runtime is admin-only.", message.id);
       return;
     }
-    const preferred = await setting(env.DB, "preferred_model_id") || "(no successful model recorded yet)";
+    const runtimeCatalog = await readModelCatalogSnapshot(env);
+    const preferred = runtimeCatalog?.lastSuccessfulModel || "(no successful model recorded yet)";
     const notes = CONVY_RELEASE_NOTES.map((note, index) => (index + 1) + ". " + note).join("\n");
     const content = "**CONVY runtime snapshot**\n" +
       buildMetadataText(env, false) + "\n" +
@@ -1811,12 +1867,17 @@ async function handleMention(env, message) {
       await sendUserReply(env, message, "Model override cleared. CONVY is back to AUTO routing in your preferred order.", message.id);
       return;
     }
-    let pool;
-    try { pool = await models(env.DB, true); }
+    let catalog;
+    try { catalog = await models(env, true); }
     catch (error) {
-      await sendUserReply(env, message, "Couldn't verify the model catalog, so I left the selection unchanged. " + String(error.message || error).slice(0, 120), message.id);
+      await sendUserReply(env, message, "Couldn't verify the live model catalog, so I left the selection unchanged. " + String(error.message || error).slice(0, 120), message.id);
       return;
     }
+    if (catalog.stale) {
+      await sendUserReply(env, message, "The live Pollinations catalog is unavailable. I left the model selection unchanged rather than trust stale pricing or eligibility.", message.id);
+      return;
+    }
+    const pool = catalog.models;
     const numericChoice = /^\d+$/.test(arg) ? Number(arg) : null;
     let requestedId = null;
     if (numericChoice !== null && numericChoice >= 1 && numericChoice <= PREFERRED_MODEL_ORDER.length) {
@@ -1853,42 +1914,49 @@ async function handleMention(env, message) {
       return;
     }
     try {
-      const pool = await models(env.DB, true);
+      // Unlike normal routing, !models always attempts a live request to Pollinations.
+      const catalog = await models(env, true);
+      const pool = catalog.models;
       const ownerSelected = await setting(env.DB, "owner_selected_model_id");
-      const lastUsed = await setting(env.DB, "preferred_model_id");
+      const lastUsed = catalog.lastSuccessfulModel || "";
       const lines = [];
       for (let index = 0; index < PREFERRED_MODEL_ORDER.length; index++) {
         const id = PREFERRED_MODEL_ORDER[index];
         const model = pool.find(item => String(item.model_id || "") === id);
         if (!model) {
-          lines.push("**" + (index + 1) + ".** ⚪ " + id + " · Not verified in free catalog");
+          lines.push("**" + (index + 1) + ".** ⚪ " + id + " · " + (catalog.stale ? "Not verified in live catalog (stale cache)" : "Not verified in free catalog"));
           continue;
         }
         const health = statusRank(model.health);
-        const state = health === 0 ? "Green" : health === 1 ? "Degraded" : health === 2 ? "Catalog warning" : "Unknown";
+        const state = catalog.stale ? "Stale snapshot" : health === 0 ? "Green" : health === 1 ? "Degraded" : health === 2 ? "Catalog warning" : "Unknown";
         const marks = [
           ownerSelected === id ? "Selected for text" : "",
           !ownerSelected && index === 0 ? "Auto first" : "",
           lastUsed === id ? "Last used successfully" : ""
         ].filter(Boolean).join(", ");
-        lines.push("**" + (index + 1) + ".** " + statusEmoji(model.health) + " " + id + " · " + state +
+        lines.push("**" + (index + 1) + ".** " + (catalog.stale ? "⚪" : statusEmoji(model.health)) + " " + id + " · " + state +
           (marks ? " · **" + marks + "**" : ""));
       }
       const green = extraGreenModels(pool);
       const visibleGreen = green.slice(0, 12);
       visibleGreen.forEach((model, index) => {
-        lines.push("**" + (index + 4) + ".** 🟢 " + model.model_id + " · Green · select with !model " + (index + 4));
+        lines.push("**" + (index + 4) + ".** " + (catalog.stale ? "⚪" : "🟢") + " " + model.model_id +
+          (catalog.stale ? " · Cached only, not selectable" : " · Green · select with !model " + (index + 4)));
       });
       if (green.length > visibleGreen.length) {
         lines.push("… plus " + (green.length - visibleGreen.length) + " more green models not numbered in this compact list.");
       }
+      const catalogStatus = catalog.stale
+        ? "⚠️ **STALE CATALOG** · last successful fetch: " + (catalog.checkedAt ? new Date(catalog.checkedAt).toISOString() : "unknown") +
+          " · cached models are shown for reference only and cannot be selected or routed."
+        : "✅ **LIVE CATALOG** · fetched " + new Date(catalog.checkedAt).toISOString() + " · catalog refresh uses zero D1 writes.";
       const prefix = "**CONVY models** · 🟢 catalog green · 🟡 degraded · ⚠️ catalog warning · ⚪ unknown\n" +
-        "Catalog health is not a live availability test. Preferred models are 1-3; green alternatives are 4-15.\n" +
-        "Switch: !model 1 through !model 15 · reset: !model auto\n\n";
+        catalogStatus + "\n" +
+        "Preferred models are 1-3; green alternatives are 4-15. Use !model 1 through !model 15 · reset with !model auto.\n\n";
       await sendUserReply(env, message, prefix + lines.join("\n"), message.id);
     } catch (error) {
       await sendUserReply(env, message,
-        "Couldn't refresh model status: " + String(error.message || error).slice(0, 150), message.id);
+        "Couldn't fetch Pollinations' live model catalog: " + String(error.message || error).slice(0, 150), message.id);
     }
     return;
   }
@@ -2203,6 +2271,71 @@ export class DiscordGateway extends DurableObject {
       } catch (error) {
         return json({ ok: false, error: String(error.message || error).slice(0, 140) }, 500);
       }
+    }
+    if (path === "/models/catalog" && request.method === "GET") {
+      const snapshot = await this.ctx.storage.get("model_catalog_snapshot") || null;
+      return json({ ok: true, snapshot });
+    }
+    if (path === "/models/catalog" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      if (!Array.isArray(body.models) || body.models.length > 500) {
+        return json({ ok: false, error: "A model catalog array with at most 500 entries is required." }, 400);
+      }
+      const finite = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+      const safeModels = body.models.filter(model =>
+        model && typeof model.model_id === "string" && model.model_id.length > 0 && model.model_id.length <= 300
+      ).map(model => ({
+        model_id: String(model.model_id),
+        source: String(model.source || "community").slice(0, 80),
+        health: String(model.health || "unknown").slice(0, 80),
+        success_rate: model.success_rate == null ? null : Math.max(0, Math.min(1, finite(model.success_rate))),
+        request_count: Math.max(0, finite(model.request_count)),
+        prompt_price: Math.max(0, finite(model.prompt_price)),
+        completion_price: Math.max(0, finite(model.completion_price)),
+        avg_latency_ms: Math.max(0, finite(model.avg_latency_ms)),
+        local_success_count: Math.max(0, finite(model.local_success_count)),
+        local_failure_count: Math.max(0, finite(model.local_failure_count))
+      }));
+      if (!safeModels.length) return json({ ok: false, error: "No valid models were supplied." }, 400);
+      const previous = await this.ctx.storage.get("model_catalog_snapshot") || {};
+      const snapshot = {
+        checkedAt: Math.max(0, finite(body.checkedAt)) || Date.now(),
+        models: safeModels,
+        lastSuccessfulModel: String(body.lastSuccessfulModel || previous.lastSuccessfulModel || "").slice(0, 300),
+        lastSuccessfulAt: Math.max(0, finite(body.lastSuccessfulAt || previous.lastSuccessfulAt))
+      };
+      await this.ctx.storage.put("model_catalog_snapshot", snapshot);
+      return json({ ok: true, count: safeModels.length, checkedAt: snapshot.checkedAt });
+    }
+    if (path === "/models/result" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      const id = String(body.id || "").slice(0, 300);
+      if (!id) return json({ ok: false, error: "Model id is required." }, 400);
+      const snapshot = await this.ctx.storage.get("model_catalog_snapshot");
+      if (!snapshot || !Array.isArray(snapshot.models)) {
+        return json({ ok: false, error: "No model catalog snapshot exists yet." }, 409);
+      }
+      const elapsed = Math.max(0, Math.min(300000, Math.round(Number(body.elapsed) || 0)));
+      const succeeded = body.succeeded === true;
+      const nextModels = snapshot.models.map(model => {
+        if (String(model.model_id) !== id) return model;
+        const priorLatency = Math.max(0, Number(model.avg_latency_ms) || 0);
+        return {
+          ...model,
+          avg_latency_ms: priorLatency <= 0 ? elapsed : priorLatency * 0.7 + elapsed * 0.3,
+          local_success_count: Math.max(0, Number(model.local_success_count) || 0) + (succeeded ? 1 : 0),
+          local_failure_count: Math.max(0, Number(model.local_failure_count) || 0) + (succeeded ? 0 : 1)
+        };
+      });
+      const nextSnapshot = { ...snapshot, models: nextModels };
+      if (succeeded) {
+        nextSnapshot.lastSuccessfulModel = id;
+        nextSnapshot.lastSuccessfulAt = Date.now();
+      }
+      await this.ctx.storage.put("model_catalog_snapshot", nextSnapshot);
+      return json({ ok: true, updated: nextModels.some(model => String(model.model_id) === id) });
     }
     if (path === "/control/status") {
       return json({ ok: true, paused: Boolean(await this.ctx.storage.get("convx_paused")), changedAt: await this.ctx.storage.get("convx_pause_changed_at") || null });
