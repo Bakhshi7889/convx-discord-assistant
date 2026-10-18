@@ -484,7 +484,60 @@ async function generateAnswer(env,db,query,channelId) {
 }
 
 function isSaveRequest(q){return /\b(save\s+(?:this|that|it|answer|info)|remember\s+(?:this|that|it)|add\s+(?:this|that)\s+to\s+(?:the\s+)?(?:knowledge|memory)|store\s+(?:this|that))\b/i.test(String(q||""));}
-function parseModelJson(text){const raw=String(text||"").trim(),a=raw.indexOf("{"),b=raw.lastIndexOf("}");if(a<0||b<=a)throw new Error("The model did not return a usable Q&A object.");return JSON.parse(raw.slice(a,b+1));}
+function parseModelJson(text) {
+  const fences = String.fromCharCode(96).repeat(3);
+  const raw = String(text || "").trim()
+    .replace(new RegExp("^" + fences + "(?:json)?\\s*", "i"), "")
+    .replace(new RegExp("\\s*" + fences + "$", "i"), "")
+    .trim();
+  const hasQna = value => value && typeof value === "object" &&
+    ("question" in value || "q" in value) && ("answer" in value || "a" in value);
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (hasQna(parsed)) return parsed;
+  } catch {}
+
+  // Find a balanced JSON object without being confused by braces inside strings.
+  for (let start = 0; start < raw.length; start++) {
+    if (raw[start] !== "{") continue;
+    let depth = 0, quoted = false, escaped = false;
+    for (let end = start; end < raw.length; end++) {
+      const char = raw[end];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === "\"") quoted = false;
+        continue;
+      }
+      if (char === "\"") quoted = true;
+      else if (char === "{") depth++;
+      else if (char === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(raw.slice(start, end + 1));
+            if (hasQna(parsed)) return parsed;
+          } catch {}
+          break;
+        }
+      }
+    }
+  }
+
+  // Accept labelled Q&A text from models that ignore JSON-only instructions.
+  const questionMatch = raw.match(/(?:^|\n)\s*(?:question|q)\s*[:=-]\s*([\s\S]*?)(?=\n\s*(?:answer|a|tags?)\s*[:=-]|$)/i);
+  const answerMatch = raw.match(/(?:^|\n)\s*(?:answer|a)\s*[:=-]\s*([\s\S]*?)(?=\n\s*tags?\s*[:=-]|$)/i);
+  const tagsMatch = raw.match(/(?:^|\n)\s*tags?\s*[:=-]\s*([\s\S]*?)\s*$/i);
+  if (questionMatch && answerMatch) {
+    return {
+      question: questionMatch[1].trim().replace(/^["']|["']$/g, ""),
+      answer: answerMatch[1].trim().replace(/^["']|["']$/g, ""),
+      tags: tagsMatch ? tagsMatch[1].trim() : ""
+    };
+  }
+  throw new Error("The model returned neither JSON nor a labelled question and answer.");
+}
 async function captureConversationAsKnowledge(env,message){
   if(!(await isAdmin(env,message)))throw new Error("Only configured admins can save conversation answers to approved knowledge.");
   const rows=await env.DB.prepare("SELECT message_id,author_name,content,created_at,message_url FROM messages WHERE channel_id=? AND message_id<>? ORDER BY created_at DESC LIMIT 30").bind(message.channel_id,message.id).all();
