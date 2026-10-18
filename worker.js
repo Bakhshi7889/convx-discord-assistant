@@ -396,10 +396,10 @@ async function addKnowledge(env, message, args) {
 }
 function resolveUserMentions(query, message) {
   const mentions = Array.isArray(message.mentions) ? message.mentions : [];
-  return String(query || "").replace(/<@!?(\\d+)>/g, (raw, id) => {
+  return String(query || "").replace(/<@!?(\d+)>/g, (raw, id) => {
     const user = mentions.find(candidate => String(candidate.id) === String(id));
     const name = String(user?.global_name || user?.username || "")
-      .replace(/[<>\\r\\n@]/g, "")
+      .replace(/[<>\r\n@]/g, "")
       .trim()
       .slice(0, 64);
     return name ? "@" + name : "the mentioned member";
