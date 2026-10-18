@@ -550,6 +550,7 @@ function withRuntimeSnapshot(messages, modelId, settings, hasImages, tuningEnabl
     "LIVE RUNTIME SNAPSHOT (authoritative for this request; use it instead of guessing):",
     "Build: " + CONVY_BUILD_VERSION,
     "Actual model handling this attempt: " + modelId,
+    "Owner-selected model override: " + (ownerSelectedId || "AUTO (preferred order)"),
     "Preferred model order: " + PREFERRED_MODEL_ORDER.join(" -> "),
     "Images included in this request: " + (hasImages ? "yes" : "no"),
     "Response settings currently applied: " + JSON.stringify(settings),
@@ -578,7 +579,12 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
   const pinnedOrder = hasImages
     ? PREFERRED_MODEL_ORDER.filter(id => VISION_MODEL_IDS.has(id))
     : PREFERRED_MODEL_ORDER;
-  const priority = new Map(pinnedOrder.map((id, index) => [id, index]));
+  const ownerSelectedId = await setting(db, "owner_selected_model_id");
+  const routingOrder = [
+    ...(ownerSelectedId && (!hasImages || VISION_MODEL_IDS.has(ownerSelectedId)) ? [ownerSelectedId] : []),
+    ...pinnedOrder
+  ].filter((id, index, all) => all.indexOf(id) === index);
+  const priority = new Map(routingOrder.map((id, index) => [id, index]));
   const candidates = pool.filter(model =>
     statusRank(model.health) !== 2 &&
     (!hasImages || VISION_MODEL_IDS.has(String(model.model_id || model.id || "")))
@@ -1210,7 +1216,7 @@ async function handleMention(env, message) {
   }
   if (command === "!help") {
     await sendUserReply(env, message,
-      "I'm CONVY (she/her), Convx's assistant: sharp, useful, and mildly allergic to nonsense. I answer questions without the theatrical monologues.\n\nMention me with a question. For a short roast, use \"@CONVY roast @member\".\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models, !runtime.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
+      "I'm CONVY (she/her), Convx's assistant: sharp, useful, and mildly allergic to nonsense. I answer questions without the theatrical monologues.\n\nMention me with a question. For a short roast, use \"@CONVY roast @member\".\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models, !model 1|2|3|auto, !runtime.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
     return;
   }
   if (isSaveRequest(command)) {
@@ -1265,51 +1271,107 @@ async function handleMention(env, message) {
     await sendUserReply(env, message, "Historical import queued. I'll keep importing older messages in batches during scheduled runs.", message.id);
     return;
   }
+  if (command === "!model" || command.startsWith("!model ")) {
+    if (!(await isAdmin(env, message))) {
+      await sendUserReply(env, message, "Only the configured Convx creator/admin can switch CONVY's model.", message.id);
+      return;
+    }
+    const arg = command.slice("!model".length).trim().toLowerCase();
+    if (!arg) {
+      const selected = await setting(env.DB, "owner_selected_model_id");
+      const title = selected ? "Current override: " + selected : "Current mode: AUTO, using the preferred order.";
+      await sendUserReply(env, message,
+        title + "\nUse !model 1, !model 2, or !model 3 to select one of the three requested models. Use !model auto to restore automatic routing. Image requests always stay on the two vision-capable models.",
+        message.id);
+      return;
+    }
+    if (arg === "auto") {
+      await setSetting(env.DB, "owner_selected_model_id", "");
+      await sendUserReply(env, message, "Model override cleared. CONVY is back to AUTO routing in your preferred order.", message.id);
+      return;
+    }
+    const selectedIndex = ({ "1": 0, "2": 1, "3": 2 })[arg];
+    const requestedId = selectedIndex === undefined
+      ? PREFERRED_MODEL_ORDER.find(id => id.toLowerCase() === arg)
+      : PREFERRED_MODEL_ORDER[selectedIndex];
+    if (!requestedId) {
+      await sendUserReply(env, message, "Use !model 1, !model 2, !model 3, or !model auto.", message.id);
+      return;
+    }
+    let pool;
+    try { pool = await models(env.DB, true); }
+    catch (error) {
+      await sendUserReply(env, message, "Couldn't verify the model catalog, so I left the selection unchanged. " + String(error.message || error).slice(0, 120), message.id);
+      return;
+    }
+    const entry = pool.find(model => String(model.model_id || "") === requestedId);
+    if (!entry) {
+      await sendUserReply(env, message,
+        "'" + requestedId + "' is not currently verified as an eligible free community text model in the live catalog. Selection unchanged.",
+        message.id);
+      return;
+    }
+    if (statusRank(entry.health) === 2) {
+      await sendUserReply(env, message,
+        "'" + requestedId + "' is currently reported down. I didn't switch to a model that is marked down. Try another model or !model auto.",
+        message.id);
+      return;
+    }
+    await setSetting(env.DB, "owner_selected_model_id", requestedId);
+    await sendUserReply(env, message,
+      "Model override set to '" + requestedId + "'. I'll prefer it for text replies. Image requests will use it only if it's one of the two vision-capable models; otherwise I'll route those to the vision models. Use !model auto to reset.",
+      message.id);
+    return;
+  }
   if (command === "!models") {
     if (!(await isAdmin(env, message))) {
-      await sendUserReply(env, message, "Nope. !models is admin-only. Confidence is not an authorization token.", message.id);
+      await sendUserReply(env, message, "Nope. !models is admin-only.", message.id);
       return;
     }
     try {
       const pool = await models(env.DB, true);
-      const preferredId = await setting(env.DB, "preferred_model_id");
-      const lines = pool.map((model, index) => {
-        const score = modelScore(model);
-        const provider = model.success_rate == null
-          ? "provider success n/a"
-          : "provider " + Math.round(100 * model.success_rate) + "%";
-        const successes = Number(model.local_success_count) || 0;
-        const failures = Number(model.local_failure_count) || 0;
-        const tests = successes + failures;
-        const local = tests > 0
-          ? "CONVY " + Math.round(100 * successes / tests) + "% (" + successes + "/" + tests + ")"
-          : "CONVY test pending";
-        const latency = Number(model.avg_latency_ms) > 0
-          ? "~" + Math.round(model.avg_latency_ms) + "ms"
-          : "speed unmeasured";
-        const benchmark = externalModelBenchmark(model);
-        const benchmarkText = benchmark
-          ? benchmark.label + " · " + benchmark.elo + " ELO"
-          : "Arena unranked";
-        const preferred = model.model_id === preferredId && successes > failures;
-        const healthLabel = statusRank(model.health) === 0 ? "HEALTHY" :
-          statusRank(model.health) === 1 ? "DEGRADED" :
-          statusRank(model.health) === 2 ? "DOWN" : "UNKNOWN";
-        return "#" + (index + 1) + " · **" + score + "/100** · " + statusEmoji(model.health) +
-          " [" + healthLabel + "] " + model.model_id + (preferred ? " · ★ CONVY default" : "") +
-          " · " + provider + " · " + local + " · " + latency + " · " + benchmarkText;
-      });
-      const intro = "**CONVY's free community text-model leaderboard**\n" +
-        "Showing " + pool.length + " eligible models sorted by composite score. Health labels identify healthy, degraded, down, and unknown models. Generation still skips models reported down. Paid/billed models are excluded.\n" +
-        "Score /100 = provider health (20), provider success (20), smoothed CONVY success (25), Text Arena family prior (25), and speed (10). The star marks CONVY's proven default. Arena data is the open-source text leaderboard snapshot from 15 Oct 2026; family scores are a prior, not a guarantee about each host.\n" +
-        "Only community text models with no billed text-token rates are listed. No paid fallback. Source: https://arena.ai/leaderboard/chat/text?license=open-source\n\n";
-      const content = pool.length
-        ? intro + lines.join("\n")
-        : "**No eligible free community text models were returned.** No paid fallback will be attempted.";
-      await sendUserReply(env, message, content, message.id);
+      const ownerSelected = await setting(env.DB, "owner_selected_model_id");
+      const lastUsed = await setting(env.DB, "preferred_model_id");
+      const lines = [];
+      for (let index = 0; index < PREFERRED_MODEL_ORDER.length; index++) {
+        const id = PREFERRED_MODEL_ORDER[index];
+        const model = pool.find(item => String(item.model_id || "") === id);
+        if (!model) {
+          lines.push("**" + (index + 1) + ".** ⚪ " + id + " · Not verified in free catalog");
+          continue;
+        }
+        const health = statusRank(model.health);
+        const state = health === 0 ? "Green" : health === 1 ? "Degraded" : health === 2 ? "Down" : "Unknown";
+        const latency = Number(model.avg_latency_ms) > 0 ? " · ~" + Math.round(model.avg_latency_ms) + " ms" : "";
+        const successCount = Number(model.local_success_count) || 0;
+        const failCount = Number(model.local_failure_count) || 0;
+        const local = successCount + failCount > 0 ? " · " + successCount + "/" + (successCount + failCount) + " ok" : "";
+        const marks = [
+          ownerSelected === id ? "Selected" : "",
+          !ownerSelected && index === 0 ? "Auto first" : "",
+          lastUsed === id ? "Last used" : ""
+        ].filter(Boolean).join(", ");
+        lines.push("**" + (index + 1) + ".** " + statusEmoji(model.health) + " " + id + " · " + state +
+          (marks ? " · **" + marks + "**" : "") + latency + local);
+      }
+      const chosen = new Set(PREFERRED_MODEL_ORDER);
+      const green = pool
+        .filter(model => !chosen.has(String(model.model_id || "")) && statusRank(model.health) === 0)
+        .sort((a, b) => modelScore(b) - modelScore(a));
+      for (const model of green) {
+        const latency = Number(model.avg_latency_ms) > 0 ? " · ~" + Math.round(model.avg_latency_ms) + " ms" : "";
+        const successCount = Number(model.local_success_count) || 0;
+        const failCount = Number(model.local_failure_count) || 0;
+        const local = successCount + failCount > 0 ? " · " + successCount + "/" + (successCount + failCount) + " ok" : "";
+        lines.push("🟢 " + model.model_id + " · Green" + latency + local);
+      }
+      const prefix = "**CONVY models** · 🟢 green · 🟡 degraded · 🔴 down · ⚪ unknown\n" +
+        "Only your 3 selected models and other green models are shown.\n" +
+        "Switch: !model 1 / !model 2 / !model 3 · reset: !model auto\n\n";
+      await sendUserReply(env, message, prefix + lines.join("\n"), message.id);
     } catch (error) {
       await sendUserReply(env, message,
-        "I couldn't refresh the green-model leaderboard: " + String(error.message || error).slice(0, 180), message.id);
+        "Couldn't refresh model status: " + String(error.message || error).slice(0, 150), message.id);
     }
     return;
   }
