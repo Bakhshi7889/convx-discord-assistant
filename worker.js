@@ -37,6 +37,16 @@ const CONVY_CURRENT_RELEASE_NOTES = [
 ];
 const CONVY_RELEASE_HISTORY = [
   {
+    version: "convx-2026-10-18-r19",
+    appliedAt: "2026-10-18T18:02:13.192561Z",
+    commit: "84227bff95f7b495541e6bee1ea06f15dee347b1",
+    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39152259279",
+    changes: [
+      "Repaired free community-model discovery to accept reliable catalog entries with unknown health when no observations exist, while rejecting explicitly down models.",
+      "Added catalog fallback handling and invalidated older cached eligibility data."
+    ]
+  },
+  {
     version: "convx-2026-10-18-r18",
     commit: "35384cdb18cbd204e3ab04484d8ec844584473e1",
     deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39151300137",
@@ -1082,7 +1092,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
   });
   if (!candidates.length) {
     throw new Error(hasImages
-      ? "No eligible, non-down vision model from CONVY's first two preferred models is available. I did not send the image to a text-only model."
+      ? "No eligible, non-down model from CONVY's configured vision-capable set is available. I did not send the image to a text-only model."
       : "All eligible community text models are currently reported down. No model was called.");
   }
 
@@ -1947,7 +1957,7 @@ async function handleMention(env, message) {
       buildMetadataText(env, false) + "\n" +
       "**Last successful model:** " + preferred + "\n" +
       "**Routing order:** " + PREFERRED_MODEL_ORDER.join(" → ") + "\n" +
-      "**Self-tuning:** first two preferred models may adjust reasoning effort, temperature, and output-token budget for one reply only. Nothing persists and no model can override the routing order.\n" +
+      "**Self-tuning:** explicitly designated settings-capable models may adjust reasoning effort, temperature, and output-token budget for one reply only. Nothing persists and no model can override the routing order.\n" +
       "**Creator/maintainer:** <@" + CONVY_CREATOR_USER_ID + ">\n" +
       "**Changes in this release:**\n" + CONVY_CURRENT_RELEASE_NOTES.map((note, index) => (index + 1) + ". " + note).join("\n") + "\n\n**Known capabilities:**\n" + notes;
     await sendUserReply(env, message, content, message.id);
