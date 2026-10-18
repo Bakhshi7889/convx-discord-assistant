@@ -328,7 +328,7 @@ async function models(db, force=false) {
     const cached=await db.prepare("SELECT model_id,source,health,success_rate,request_count,avg_latency_ms,local_success_count,local_failure_count FROM models WHERE eligible=1").all();
     return sortModelRows(cached.results||[]);
   }
-  const response=await fetch(POLLINATIONS_API+"/text/models?source=community&reliability=all",{headers:{"accept":"application/json"},signal:AbortSignal.timeout(10000)});
+  const response=await fetch(POLLINATIONS_API+"/text/models?community=true&reliability=all",{headers:{"accept":"application/json"},signal:AbortSignal.timeout(10000)});
   if(!response.ok)throw new Error("Pollinations model catalog returned HTTP "+response.status);
   const all=catalogModels(await response.json()), eligible=[];
   for(const model of all){
