@@ -92,6 +92,16 @@ async function sendReply(env, channelId, content, replyTo, mentionTargets = null
   return firstSent;
 }
 
+async function sendUserReply(env, message, content, replyTo = message.id, extraTargets = null) {
+  const authorId = String(message.author?.id || "");
+  const valid = value => /^\d{15,22}$/.test(String(value || ""));
+  const users = [...new Set([
+    ...(valid(authorId) ? [authorId] : []),
+    ...((extraTargets?.users || []).map(String).filter(valid))
+  ])];
+  const prefix = valid(authorId) ? "<@" + authorId + "> " : "";
+  return sendReply(env, message.channel_id, prefix + String(content || ""), replyTo, { users, roles: [] });
+}
 function idList(value) {
   return String(value || "").split(",").map(v => v.trim()).filter(Boolean);
 }
@@ -681,7 +691,8 @@ function buildMemberRoast(query, message, env) {
   for (const char of (id || name).toLowerCase()) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
   return {
     handled: true,
-    content: "**" + name + "** " + roasts[hash % roasts.length]
+    content: target ? "<@" + target.id + "> " + roasts[hash % roasts.length] : "**" + name + "** " + roasts[hash % roasts.length],
+    targetUserId: target ? String(target.id) : ""
   };
 }
 async function handleMention(env, message) {
@@ -692,75 +703,75 @@ async function handleMention(env, message) {
   if (!mention.test(message.content || "")) return;
   const query = String(message.content || "").replace(mention, "").trim();
   if (!query) {
-    await sendReply(env, message.channel_id, "Hey, I'm CONVY (she/her), the Convx assistant with receipts, opinions, and very little patience for broken logic. Give me an actual question, or try @Convx Assistant !help.", message.id);
+    await sendUserReply(env, message, "Hey, I'm CONVY (she/her), the Convx assistant with receipts, opinions, and very little patience for broken logic. Give me an actual question, or try @Convx Assistant !help.", message.id);
     return;
   }
   const command = query.trim();
   const roast = buildMemberRoast(command, message, env);
   if (roast?.handled) {
-    await sendReply(env, message.channel_id, roast.content, message.id);
+    await sendUserReply(env, message, roast.content, message.id, { users: roast.targetUserId ? [roast.targetUserId] : [] });
     return;
   }
   if (command === "!help") {
-    await sendReply(env, message.channel_id,
+    await sendUserReply(env, message,
       "I'm CONVY (she/her), Convx's assistant: sharp, useful, and mildly allergic to nonsense. I answer questions without the theatrical monologues.\n\nMention me with a question. For a short roast, use \"@CONVY roast @member\".\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
     return;
   }
   if (isSaveRequest(command)) {
     if (!(await isAdmin(env, message))) {
-      await sendReply(env, message.channel_id, "Only configured admins can save conversation context as approved knowledge.", message.id);
+      await sendUserReply(env, message, "Only configured admins can save conversation context as approved knowledge.", message.id);
       return;
     }
     try {
       const saved = await captureConversationAsKnowledge(env, message);
-      await sendReply(env, message.channel_id, "Saved approved answer #" + saved.id + ".\n**Question:** " + saved.question + "\n**Answer:** " + saved.answer + "\n*Extracted with " + saved.modelId + "*", message.id);
+      await sendUserReply(env, message, "Saved approved answer #" + saved.id + ".\n**Question:** " + saved.question + "\n**Answer:** " + saved.answer, message.id);
     } catch (error) {
       const alert = await claimAdminAlert(env, env.DB, "save-failure");
-      const text = (alert?.mentions ? alert.mentions + "\n" : "") + "I tried to save that conversation, but missing context won't materialize out of pure confidence: " + String(error.message || error).slice(0, 220);
-      await sendReply(env, message.channel_id, text, message.id, alert?.targets || null);
+      const text = (alert?.mentions ? alert.mentions + "\n" : "") + "I couldn't save that yet. The conversation wasn't added to approved knowledge. " + String(error.message || error).slice(0, 200);
+      await sendUserReply(env, message, text, message.id, alert?.targets || null);
     }
     return;
   }
   if (command.startsWith("!add ")) {
-    await sendReply(env, message.channel_id, await addKnowledge(env, message, command.slice(5)), message.id);
+    await sendUserReply(env, message, await addKnowledge(env, message, command.slice(5)), message.id);
     return;
   }
   if (command === "!list") {
     if (!(await isAdmin(env, message))) {
-      await sendReply(env, message.channel_id, "Only configured Convx admins can list knowledge entries.", message.id);
+      await sendUserReply(env, message, "Only configured Convx admins can list knowledge entries.", message.id);
       return;
     }
     const rows = await env.DB.prepare("SELECT id,question FROM knowledge ORDER BY id DESC LIMIT 20").all();
     const content = (rows.results || []).map(row => "#" + row.id + " · " + row.question).join("\n") || "No approved answers yet.";
-    await sendReply(env, message.channel_id, content, message.id);
+    await sendUserReply(env, message, content, message.id);
     return;
   }
   if (command.startsWith("!delete ")) {
     if (!(await isAdmin(env, message))) {
-      await sendReply(env, message.channel_id, "Only configured Convx admins can delete knowledge entries.", message.id);
+      await sendUserReply(env, message, "Only configured Convx admins can delete knowledge entries.", message.id);
       return;
     }
     const id = Number(command.slice(8).trim());
     if (!Number.isSafeInteger(id) || id < 1) {
-      await sendReply(env, message.channel_id, "Use !delete ID.", message.id);
+      await sendUserReply(env, message, "Use !delete ID.", message.id);
       return;
     }
     const result = await env.DB.prepare("DELETE FROM knowledge WHERE id=?").bind(id).run();
-    await sendReply(env, message.channel_id, result.meta.changes ? "Deleted approved answer #" + id + "." : "No approved answer found with that ID.", message.id);
+    await sendUserReply(env, message, result.meta.changes ? "Deleted approved answer #" + id + "." : "No approved answer found with that ID.", message.id);
     return;
   }
   if (command === "!sync") {
     if (!(await isAdmin(env, message))) {
-      await sendReply(env, message.channel_id, "Only configured Convx admins can start history import.", message.id);
+      await sendUserReply(env, message, "Only configured Convx admins can start history import.", message.id);
       return;
     }
     await startHistorySync(env.DB);
-    await sendReply(env, message.channel_id, "Historical import queued. I'll keep importing older messages in batches during scheduled runs.", message.id);
+    await sendUserReply(env, message, "Historical import queued. I'll keep importing older messages in batches during scheduled runs.", message.id);
     return;
   }
   if (command === "!models") {
     if (!(await isAdmin(env, message))) {
-      await sendReply(env, message.channel_id, "Nope. !models is admin-only. Confidence is not an authorization token.", message.id);
+      await sendUserReply(env, message, "Nope. !models is admin-only. Confidence is not an authorization token.", message.id);
       return;
     }
     try {
@@ -797,21 +808,21 @@ async function handleMention(env, message) {
       const content = pool.length
         ? intro + lines.join("\n")
         : "**No green models right now.** Red, yellow and unknown providers are hidden rather than decorated with optimism. CONVY can retry eligible degraded models for a reply, but will not attempt anything marked down or paid-only.";
-      await sendReply(env, message.channel_id, content, message.id);
+      await sendUserReply(env, message, content, message.id);
     } catch (error) {
-      await sendReply(env, message.channel_id,
+      await sendUserReply(env, message,
         "I couldn't refresh the green-model leaderboard: " + String(error.message || error).slice(0, 180), message.id);
     }
     return;
   }
   try {
     const answer = await generateAnswer(env, env.DB, resolveUserMentions(query, message), message.channel_id);
-    await sendReply(env, message.channel_id, answer, message.id);
+    await sendUserReply(env, message, answer, message.id);
   } catch (error) {
     const alert = await claimAdminAlert(env, env.DB, "answer-failure");
     const text = (alert?.mentions ? alert.mentions + "\n" : "") + "CONVY's free-model stack failed before I could give you a reliable answer. " +
       String(error.message || error).slice(0, 220) + "\nI will not quietly switch to a paid model. If this is urgent, ask a Convx admin now; if it keeps happening, an admin should check the Worker logs.";
-    await sendReply(env, message.channel_id, text, message.id, alert?.targets || null);
+    await sendUserReply(env, message, text, message.id, alert?.targets || null);
   }
 }
 async function fetchChannelMessages(env, channelId, params) {
