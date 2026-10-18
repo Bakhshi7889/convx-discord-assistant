@@ -44,8 +44,31 @@ jobs:
           node-version: "22"
       - name: Install Wrangler
         run: npm install --global wrangler@4
+      - name: Prepare deployment metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_VERSION="$(sed -n 's/^const CONVY_BUILD_VERSION = "\\([^"]*\\)";$/\\1/p' worker.js)"
+          test -n "$BUILD_VERSION"
+          BUILD_COMMIT="$GITHUB_SHA"
+          BUILD_COMMIT_AT="$(git show -s --format=%cI "$GITHUB_SHA")"
+          BUILD_APPLIED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          BUILD_DEPLOYMENT_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "BUILD_VERSION=$BUILD_VERSION"
+            echo "BUILD_COMMIT=$BUILD_COMMIT"
+            echo "BUILD_COMMIT_AT=$BUILD_COMMIT_AT"
+            echo "BUILD_APPLIED_AT=$BUILD_APPLIED_AT"
+            echo "BUILD_DEPLOYMENT_URL=$BUILD_DEPLOYMENT_URL"
+          } >> "$GITHUB_ENV"
       - name: Deploy to Cloudflare
-        run: wrangler deploy
+        run: >
+          wrangler deploy
+          --var "BUILD_VERSION:$BUILD_VERSION"
+          --var "BUILD_COMMIT:$BUILD_COMMIT"
+          --var "BUILD_COMMIT_AT:$BUILD_COMMIT_AT"
+          --var "BUILD_APPLIED_AT:$BUILD_APPLIED_AT"
+          --var "BUILD_DEPLOYMENT_URL:$BUILD_DEPLOYMENT_URL"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
