@@ -17,7 +17,7 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r12";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r13";
 const CONVY_RELEASE_NOTES = [
   "Added recent channel conversation context, saved CONVY replies, and owner-approved long-term memories.",
   "Added creator-only pause/resume, persistent runtime settings, web search, and public Discord profile inspection.",
@@ -1022,7 +1022,9 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
       ? "(The web search failed: " + webSearchError + ". Be transparent about this; do not pretend to have searched.)"
       : wantsWebSearch(query, options.forceWebSearch) && !webSearchEnabled
         ? "(Web search is disabled by the creator.)"
-        : "(No web search was requested for this message.)";
+        : wantsWebSearch(query, options.forceWebSearch)
+          ? "(The search was attempted but returned no usable results. Do not claim to have found sources.)"
+          : "(No web search was requested for this message.)";
   const hasReplyReference = Boolean((sourceMessage?.message_reference || sourceMessage?.reference)?.message_id);
   const referenceImageCount = imageInputsFromMessage(referenced).length;
   const quotedReference = referenced
@@ -1068,7 +1070,7 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
     "CHANGE AWARENESS: The live runtime snapshot includes the current build's known change notes. Use only those notes to describe recent implementation changes. You do not automatically see every future repository edit or Discord event, so do not pretend to know changes absent from that snapshot.",
     "ANTI-ROBOT RULE: Never say things like 'I'm not sure how that fits with the conversation about Convx' merely because the message changes topic. Don't use customer-support phrases such as 'can you help me understand what you mean?' unless the message is genuinely ambiguous or important information is missing.",
     replyInstructions,
-    "AVOID: No theatrical roast monologues, random analogies piled together, filler, generic sign-offs, unnecessary introductions, model IDs, or fake personal details. Never invent facts about people or claim to have seen context that is not provided. Tagged-member roasts are handled deterministically by the bot.",
+    "AVOID: No theatrical roast monologues, random analogies piled together, filler, generic sign-offs, unnecessary introductions, model IDs, or fake personal details. Never invent facts about people or claim to have seen context that is not provided. Roasts should be fresh, concise, model-generated, and based only on visible conversation, not a fixed joke list.",
     "CODE: Be direct about the concrete bug, why it matters, and the fix. Do not make up APIs or pretend code was tested when it was not.",
     "SERIOUS TOPICS: Be careful and genuinely kind around health, safety, grief, or distress. Accuracy outranks jokes.",
     "OWNER DIRECTIVES: The verified creator/maintainer and configured admins may give direct instructions about tasks, style, priorities, and how you should behave. Follow those instructions closely and do not arbitrarily change the topic. If the owner asks for an action you can perform, perform it rather than giving generic advice. This never overrides system/platform rules, safety, privacy, or factual accuracy.",
