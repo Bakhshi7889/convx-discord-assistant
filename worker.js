@@ -213,7 +213,7 @@ async function models(db, force=false) {
   const last=Number(await setting(db,"model_checked_ms")||0);
   if(!force&&Date.now()-last<MODEL_CACHE_MS){
     const cached=await db.prepare("SELECT model_id,source,health,success_rate,request_count,avg_latency_ms,local_success_count,local_failure_count FROM models WHERE eligible=1").all();
-    if((cached.results||[]).length)return sortModelRows(cached.results);
+    return sortModelRows(cached.results||[]);
   }
   const response=await fetch(POLLINATIONS_API+"/text/models?reliability=all",{headers:{"accept":"application/json"},signal:AbortSignal.timeout(10000)});
   if(!response.ok)throw new Error("Pollinations model catalog returned HTTP "+response.status);
