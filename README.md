@@ -1,6 +1,6 @@
 # Convx Discord Assistant
 
-A Cloudflare Worker + D1 Discord assistant for Convx. It polls up to 20 accessible guild channels per minute, archives messages with per-channel cursors, and replies to mentions. It answers from admin-approved knowledge first and uses Pollinations text models only when input and output prices are explicitly zero.
+A Cloudflare Worker + D1 Discord assistant for Convx. It polls up to 20 accessible guild channels per minute, archives messages with per-channel cursors, and replies to mentions. It answers from admin-approved knowledge first and uses Pollinations text models only when text input and output prices are explicitly zero. CONVY uses she/her and a dry, sarcastic code-reviewer voice, with playful roasts and complete, useful answers. Serious questions keep the same voice without sacrificing accuracy or care.
 
 ## Discord setup
 
@@ -11,7 +11,7 @@ A Cloudflare Worker + D1 Discord assistant for Convx. It polls up to 20 accessib
 
 ## Pollinations setup
 
-Create a server-side secret key at https://enter.pollinations.ai/keys. Store it only as a Cloudflare Worker secret. The worker refreshes the public text-model catalog hourly, recognizes Pollinations' `promptTextPrice` and `completionTextPrice` fields, excludes models that are paid-only or have unknown/non-zero text prices, then ranks health and observed response latency. It records local success and latency statistics. A payment-required response stops fallback immediately; it must never intentionally use a paid model.
+Create a server-side secret key at https://enter.pollinations.ai/keys. Store it only as a Cloudflare Worker secret. The worker refreshes the public text-model catalog hourly, recognizes current and legacy Pollinations price fields, and excludes paid-only models or models whose text input/output prices are unknown or non-zero. `!models` lists every verified zero-priced text model in descending score order. Scores out of 100 use provider health, provider-reported success, CONVY's measured success rate, latency, and sample confidence. Local success and latency statistics are recorded. Long Discord replies are split into separate messages instead of being silently truncated. A payment-required response stops fallback immediately; it must never intentionally use a paid model.
 
 ## Cloudflare
 
@@ -61,7 +61,7 @@ Node.js is sufficient to syntax-check `worker.js`:
 node --check worker.js
 ```
 
-Syntax checks pass, but end-to-end live-model replies and conversational saving still need a Discord test after installation and channel permissions are correct.
+GitHub Actions checks Worker syntax and deployment configuration on every push. End-to-end live-model replies and conversation saving still need a Discord test with correct bot installation and channel permissions.
 
 
 ## GitHub Actions
