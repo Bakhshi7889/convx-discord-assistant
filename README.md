@@ -17,11 +17,21 @@ CONVY is a Discord conversational assistant running on a Cloudflare Worker with 
 3. Under **OAuth2 → URL Generator**, select `bot` and `applications.commands`. Grant View Channel and Read Message History in channels the bot should monitor, Send Messages in ordinary text/announcement channels, and Send Messages in Threads for thread replies, including forum/media posts. Then invite it to Convx.
 4. Set the bot ID, guild ID, target channel ID, admin role IDs, and your own Discord user ID in the Worker variables. Enable Developer Mode in Discord to copy IDs.
 
-## Pollinations and model routing
+## Model providers and routing
 
-Create a server-side key at https://enter.pollinations.ai/keys and store it only as the `POLLINATIONS_API_KEY` Worker secret. The Worker reads `https://gen.pollinations.ai/models?source=community&reliability=reliable`, rejects explicitly down/unhealthy models, and requires a supported text chat-completions endpoint plus explicit numeric zero prices for both input and output text tokens. Any positive, malformed, or missing required price is rejected; `paid_only: false` alone is not proof that generation is free. Models whose health is unknown may be accepted when the reliable catalog has no observations, but their availability is not guaranteed. The built-in response style layer prioritizes answer-first concise replies, light Discord Markdown, and truthful tool-use claims. It is separate from the character, safety, and backend logic. `!models` forces a live fetch and writes no catalog rows to D1. `!model 1-15` reuses the current verified snapshot when it is within the one-hour freshness window, rather than immediately forcing a second catalog request. The bot reports when a fresh catalog couldn't be saved. Normal routing uses a one-hour lazy-refresh snapshot in Durable Object storage; old catalog schemas and stale data are not used for inference requests.
+### Primary: OpenRouter
 
-`!models` displays the five preferred models in this exact rank order:
+The default primary provider is OpenRouter with `liquid/lfm-2.5-2.6b:free`. Configure the model through `OPENROUTER_MODEL` and provider priority through `PRIMARY_MODEL_PROVIDER`; both are non-secret Worker variables in `wrangler.toml`. Before sending a request, the Worker verifies the configured model's ID, text modality, and explicit zero prompt/completion pricing against OpenRouter's model metadata. Successful checks are cached for 15 minutes in Durable Object storage, not D1. Model IDs that are not a `:free` variant or whose current prices cannot be confirmed as zero are rejected.
+
+Store the OpenRouter key only as the Cloudflare Worker secret `OPENROUTER_API_KEY`. Never put it in source code, `wrangler.toml`, GitHub commits, or chat. The code retries transient OpenRouter timeouts, rate limits, and provider errors once, then falls back to the existing Pollinations model route. A missing OpenRouter key also causes Pollinations fallback, and `/health` and `!runtime` show whether the secret is configured without revealing it. Explicit `!model 1-15` selections continue to use the existing Pollinations models; `!model auto` restores OpenRouter as the default text primary. The configured LFM model is text-only, so image requests continue to the explicit Pollinations vision-capable set.
+
+**Privacy note:** OpenRouter's listing for this Liquid model says prompts and outputs may be retained and used to train Liquid models. CONVY sends its system instructions and relevant conversation context to the provider. Do not route secrets or sensitive personal/private information through this model.
+
+### Pollinations free fallbacks
+
+Create a server-side key at https://enter.pollinations.ai/keys and store it only as the `POLLINATIONS_API_KEY` Worker secret. The Worker reads `https://gen.pollinations.ai/models?source=community&reliability=reliable`, rejects explicitly down/unhealthy models, and requires a supported text chat-completions endpoint plus explicit numeric zero prices for both input and output text tokens. Any positive, malformed, or missing required price is rejected; `paid_only: false` alone is not proof that generation is free. Models whose health is unknown may be accepted when the reliable catalog has no observations, but their availability is not guaranteed. The built-in response style layer prioritizes answer-first concise replies, light Discord Markdown, and truthful tool-use claims. It is separate from the character, safety, and backend logic. `!models` forces a live Pollinations fetch and writes no catalog rows to D1. `!model 1-15` reuses the current verified snapshot when it is within the one-hour freshness window. Normal Pollinations routing uses a one-hour lazy-refresh snapshot in Durable Object storage; old catalog schemas and stale data are not used for inference requests.
+
+`!models` displays the five Pollinations fallback models in this exact rank order:
 1. `community/scriptsnsenses-sys/diffusiongema-26B-free` (Gemma Diffusion 26B)
 2. `community/pegalink/jimmy` (Jimmy)
 3. `community/YoannDev90/poolside-laguna-s-2.1:free` (Laguna S 2.1)
@@ -38,8 +48,11 @@ Database ID: `9da42b8b-4129-40bf-b19a-d76acb7ee801`
 The deployed Worker is `convx-discord-assistant`. Required Worker secrets:
 - `DISCORD_TOKEN`
 - `POLLINATIONS_API_KEY`
+- `OPENROUTER_API_KEY` (required for the OpenRouter primary; without it the Worker uses the Pollinations fallback)
 
 Worker variables:
+- `PRIMARY_MODEL_PROVIDER` (`openrouter` by default; can be set to `pollinations`)
+- `OPENROUTER_MODEL` (defaults to `liquid/lfm-2.5-2.6b:free`; use only verified free IDs)
 - `TARGET_CHANNEL_ID`
 - `BOT_USER_ID`
 - `GUILD_ID`
