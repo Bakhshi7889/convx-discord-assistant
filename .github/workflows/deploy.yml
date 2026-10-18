@@ -25,11 +25,15 @@ jobs:
           test -f wrangler.toml
           test -f schema.sql
           grep -q 'name = "convx-discord-assistant"' wrangler.toml
+      - name: Install Wrangler
+        run: npm install --global wrangler@4
+      - name: Validate Worker bundle and Durable Object migrations
+        run: wrangler deploy --dry-run
 
   deploy:
     needs: validate
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
