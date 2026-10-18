@@ -17,21 +17,21 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r14";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r15";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Added runtime-injected Git commit, source commit timestamp, deployment timestamp, and deployment-run link, plus !version and !changes commands.",
-  "Added image search with visible image embeds and source links using DuckDuckGo, with Wikimedia Commons fallback and attribution metadata where available."
+  "Fetch the live Pollinations community model catalog for !models and show the catalog timestamp.",
+  "Cache verified free-model catalog data and local model-performance stats in Durable Object storage with a one-hour lazy-refresh interval, eliminating model-catalog and per-attempt metrics writes to D1.",
+  "Treat stale catalog data as display-only: do not use it for model selection or new inference requests when the live catalog cannot be verified."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
-    version: "convx-2026-10-18-r13",
-    appliedAt: "2026-10-18T16:29:38Z",
-    commit: "2e8b3c84ece5bb2e05d1c671f3bfbafe43b8953e",
-    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39145200553",
+    version: "convx-2026-10-18-r14",
+    appliedAt: "2026-10-18T16:44:03.937201Z",
+    commit: "81638c3dec06672c01bd50a9551df728cafcb594",
+    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39146304759",
     changes: [
-      "Added a rolling per-channel conversation buffer including CONVY's own replies and owner-saved long-term memories.",
-      "Added creator-only pause/resume, persistent model-response settings, web search, and public Discord profile inspection.",
-      "Removed fixed canned roast lines and improved natural conversational continuity."
+      "Added runtime-injected Git commit, source commit timestamp, deployment timestamp, and deployment-run link, plus !version and !changes commands.",
+      "Added image search with visible image embeds and source links using DuckDuckGo, with Wikimedia Commons fallback and attribution metadata where available."
     ]
   }
 ];
