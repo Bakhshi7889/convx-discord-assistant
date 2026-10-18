@@ -2,7 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
-const MODEL_CACHE_MS = 60 * 60 * 1000;
+// Refreshing the full model catalog rewrites many D1 rows. Daily is enough for a free-tier bot.
+const MODEL_CACHE_MS = 24 * 60 * 60 * 1000;
 const MODEL_ATTEMPT_LIMIT = 2;
 const MODEL_TIMEOUT_MS = 5000;
 const MAX_REPLY = 1850;
@@ -1362,8 +1363,10 @@ export class DiscordGateway extends DurableObject {
 
   async processMessage(message) {
     if (!message || message.guild_id !== String(this.env.GUILD_ID || "") || message.author?.bot) return;
-    await saveMessage(this.env, this.env.DB, message);
+    // Do not write every ordinary server message to D1. Store messages that actually
+    // invoke CONVY; replied-to source messages are fetched and saved on demand.
     if (!isBotMention(this.env, message)) return;
+    await saveMessage(this.env, this.env.DB, message);
     const claimed = await claimMentionOnce(this.env.DB, message);
     if (!claimed) return;
     await handleMention(this.env, message);
