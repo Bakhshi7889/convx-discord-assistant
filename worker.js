@@ -17,7 +17,7 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r4";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r5";
 const CONVY_RELEASE_NOTES = [
   "Pinned the requested free-model order: GLM-5.3-Flash-Free, Muse-Glimmer-30B:free, then Jimmy when the live catalog confirms it is eligible.",
   "Added multimodal input for Discord images and a recent-image lookup for follow-up questions.",
@@ -25,7 +25,8 @@ const CONVY_RELEASE_NOTES = [
   "Added live model identity and request settings to the model's context.",
   "Added a bounded response-settings tool for per-reply reasoning effort, temperature, and output-token budget.",
   "Compact !models now shows the three requested models plus other green models only.",
-  "Added owner-only !model 1, !model 2, !model 3, and !model auto switching commands."
+  "Added owner-only !model 1, !model 2, !model 3, and !model auto switching commands.",
+  "Simplified model status lines and capped extra green alternatives for readability."
 ];
 const RESPONSE_SETTINGS_TOOL = [{
   type: "function",
@@ -1338,31 +1339,27 @@ async function handleMention(env, message) {
         }
         const health = statusRank(model.health);
         const state = health === 0 ? "Green" : health === 1 ? "Degraded" : health === 2 ? "Down" : "Unknown";
-        const latency = Number(model.avg_latency_ms) > 0 ? " · ~" + Math.round(model.avg_latency_ms) + " ms" : "";
-        const successCount = Number(model.local_success_count) || 0;
-        const failCount = Number(model.local_failure_count) || 0;
-        const local = successCount + failCount > 0 ? " · " + successCount + "/" + (successCount + failCount) + " ok" : "";
         const marks = [
-          ownerSelected === id ? "Selected" : "",
+          ownerSelected === id ? "Selected for text" : "",
           !ownerSelected && index === 0 ? "Auto first" : "",
-          lastUsed === id ? "Last used" : ""
+          lastUsed === id ? "Last used successfully" : ""
         ].filter(Boolean).join(", ");
         lines.push("**" + (index + 1) + ".** " + statusEmoji(model.health) + " " + id + " · " + state +
-          (marks ? " · **" + marks + "**" : "") + latency + local);
+          (marks ? " · **" + marks + "**" : ""));
       }
       const chosen = new Set(PREFERRED_MODEL_ORDER);
       const green = pool
         .filter(model => !chosen.has(String(model.model_id || "")) && statusRank(model.health) === 0)
         .sort((a, b) => modelScore(b) - modelScore(a));
-      for (const model of green) {
-        const latency = Number(model.avg_latency_ms) > 0 ? " · ~" + Math.round(model.avg_latency_ms) + " ms" : "";
-        const successCount = Number(model.local_success_count) || 0;
-        const failCount = Number(model.local_failure_count) || 0;
-        const local = successCount + failCount > 0 ? " · " + successCount + "/" + (successCount + failCount) + " ok" : "";
-        lines.push("🟢 " + model.model_id + " · Green" + latency + local);
+      const visibleGreen = green.slice(0, 12);
+      for (const model of visibleGreen) {
+        lines.push("🟢 " + model.model_id + " · Green");
+      }
+      if (green.length > visibleGreen.length) {
+        lines.push("… plus " + (green.length - visibleGreen.length) + " more green models (hidden to keep the list short).");
       }
       const prefix = "**CONVY models** · 🟢 green · 🟡 degraded · 🔴 down · ⚪ unknown\n" +
-        "Only your 3 selected models and other green models are shown.\n" +
+        "Your 3 chosen models + up to 12 other green models.\n" +
         "Switch: !model 1 / !model 2 / !model 3 · reset: !model auto\n\n";
       await sendUserReply(env, message, prefix + lines.join("\n"), message.id);
     } catch (error) {
