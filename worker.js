@@ -526,6 +526,64 @@ function resolveUserMentions(query, message) {
     return name ? "@" + name : "the mentioned member";
   });
 }
+function buildMemberRoast(query, message, env) {
+  const text = String(query || "").trim();
+  const command = text.match(/^\s*(?:(?:please|can you|could you|hey)\s+)*(?:roast|cook|flame)\b/i);
+  if (!command) return null;
+
+  const botId = String(env.BOT_USER_ID || "");
+  const users = Array.isArray(message.mentions) ? message.mentions : [];
+  const target = users.find(user =>
+    user && String(user.id) !== botId && String(user.id) !== String(message.author?.id)
+  );
+
+  let name = target?.global_name || target?.username || "";
+  let id = String(target?.id || "");
+  if (!name) {
+    const tail = text.slice(command[0].length)
+      .replace(/<@!?\d+>/g, "")
+      .replace(/[.!?]+$/g, "")
+      .trim();
+    const generic = /^(?:a\s+)?(?:member|user|someone|anyone|them|this person|that person)?[\s,]*$/i.test(tail);
+    if (!tail || generic || /<@!?\d+>/.test(text)) {
+      return {
+        handled: true,
+        content: "Tag the actual target, like @CONVY roast @Akspro. I do one-line roasts, not an incident report about someone's imaginary GPU opinions."
+      };
+    }
+    name = tail;
+    id = name.toLowerCase();
+  }
+
+  name = String(name)
+    .replace(/[<>@*_~|\r\n]/g, "")
+    .replace(/\s+/g, " ")
+    .slice(0, 40)
+    .trim() || "That member";
+
+  const roasts = [
+    "has the confidence of production software and the QA coverage of a napkin.",
+    "has main-character confidence with side-quest execution.",
+    "could turn a two-step task into a three-week postmortem.",
+    "delivers comebacks with the latency of satellite internet.",
+    "is the human equivalent of a loading spinner with strong opinions.",
+    "has a roadmap, a vision, and no evidence the deploy passed QA.",
+    "brings 'works on my machine' energy to conversations.",
+    "could create a merge conflict in a group chat.",
+    "has the confidence of a green status light wired to nothing.",
+    "could lose an argument to the typing indicator, then ask for a rematch.",
+    "is proof that confidence and competence are separate subscription tiers.",
+    "makes a simple plan look like an unmaintained legacy system.",
+    "has the timing of an update that starts during a presentation.",
+    "would submit a blank file and call it a minimalist release."
+  ];
+  let hash = 0;
+  for (const char of (id || name).toLowerCase()) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return {
+    handled: true,
+    content: "**" + name + "** " + roasts[hash % roasts.length] + " That's the roast. No fabricated biography, no GPU-themed novella."
+  };
+}
 async function handleMention(env, message) {
   if (message.author?.bot) return;
   const botId = String(env.BOT_USER_ID || "");
@@ -538,6 +596,11 @@ async function handleMention(env, message) {
     return;
   }
   const command = query.trim();
+  const roast = buildMemberRoast(command, message, env);
+  if (roast?.handled) {
+    await sendReply(env, message.channel_id, roast.content, message.id);
+    return;
+  }
   if (command === "!help") {
     await sendReply(env, message.channel_id,
       "I'm CONVY (she/her), Convx's sarcastic resident AI. I answer questions, use the approved server notes, remember useful conversations when admins ask, and occasionally roast the logic that brought us here.\n\nMention me with a question. Ask me to \"roast @member\" for playful teasing; I'll roast the choices, not someone's identity.\n\n**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models.\nSay \"save this\" to turn recent channel conversation into one approved Q&A.", message.id);
