@@ -182,8 +182,8 @@ function firstPresent(objects, keys) {
 }
 function modelPrices(model) {
   const pricing=model.pricing||model.prices||model.costs||{};
-  const promptKeys=["promptTextPrice","prompt_text_price","promptText","inputText","textInput","prompt_text","input_text","promptPrice","inputPrice","prompt_price","input_price","promptTokenPrice","inputTokenPrice","prompt_token_price","input_token_price"];
-  const outputKeys=["completionTextPrice","completion_text_price","completionText","outputText","textOutput","completion_text","output_text","completionPrice","outputPrice","completion_price","output_price","completionTokenPrice","outputTokenPrice","completion_token_price","output_token_price"];
+  const promptKeys=["promptTextTokens","prompt_text_tokens","inputTextTokens","input_text_tokens","promptTextPrice","prompt_text_price","promptText","inputText","textInput","prompt_text","input_text","promptPrice","inputPrice","prompt_price","input_price","promptTokenPrice","inputTokenPrice","prompt_token_price","input_token_price","promptCachedTokens","prompt_cached_tokens","promptCacheWriteTokens","prompt_cache_write_tokens"];
+  const outputKeys=["completionTextTokens","completion_text_tokens","completionTextPrice","completion_text_price","completionText","outputText","textOutput","completion_text","output_text","completionPrice","outputPrice","completion_price","output_price","completionTokenPrice","outputTokenPrice","completion_token_price","output_token_price","completionReasoningTokens","completion_reasoning_tokens"];
   return {input:firstPresent([pricing,model],promptKeys),output:firstPresent([pricing,model],outputKeys)};
 }
 function verifiedFreeTextModel(model) {
