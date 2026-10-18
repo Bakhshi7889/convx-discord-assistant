@@ -4,26 +4,36 @@ const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
 // Lazy-refresh the shared Pollinations catalog hourly in Durable Object storage, never D1.
 const MODEL_CACHE_MS = 60 * 60 * 1000;
-const MODEL_CATALOG_SCHEMA_VERSION = 4;
+const MODEL_CATALOG_SCHEMA_VERSION = 5;
 const MODEL_ATTEMPT_LIMIT = 3;
 const MODEL_TIMEOUT_MS = 9000;
 // Explicit first-choice order. Models still must appear in the live catalog as eligible,
 // free community text models before they can be called.
 const PREFERRED_MODEL_ORDER = [
+  "community/scriptsnsenses-sys/diffusiongema-26B-free",
+  "community/pegalink/jimmy",
+  "community/YoannDev90/poolside-laguna-s-2.1:free",
   "community/YoannDev90/muse-glimmer-30b:free",
-  "community/morriszdweck/glm-5.3-flash-free",
-  "community/pegalink/jimmy"
+  "community/chirag-gamer/gpt-oss-120b"
 ];
-const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
-const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
+// Do not infer modality support from ranking: only these catalog candidates may handle images.
+const VISION_MODEL_IDS = new Set([
+  "community/scriptsnsenses-sys/diffusiongema-26B-free",
+  "community/YoannDev90/muse-glimmer-30b:free"
+]);
+// Keep tool-setting support explicit and independent of preferred rank.
+const SETTINGS_CAPABLE_MODEL_IDS = new Set([
+  "community/YoannDev90/muse-glimmer-30b:free",
+  "community/morriszdweck/glm-5.3-flash-free"
+]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r19";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r20";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Set community/YoannDev90/muse-glimmer-30b:free as CONVY's first-choice text model, followed by GLM-5.3-Flash-Free and Jimmy.",
-  "Fix free community model discovery to accept Pollinations reliable-catalog entries whose health is unknown because no observations exist, while rejecting explicitly unhealthy models.",
-  "Fall back from /models to /text/models when the first catalog contains no eligible models; keep requiring explicitly zero input and output text-token prices.",
-  "Bump the cached model-catalog schema so stale eligibility data is not reused after the filter fix."
+  "Set preferred free community text-model order to Gemma Diffusion 26B, Jimmy, Laguna S 2.1, Muse Glimmer 30B, and GPT OSS 120B, matching the creator's specified ranking.",
+  "Make preferred-model numbering and alternative-model choices dynamic so !model 1-5 select the ranked list and !model 6-15 select other eligible green models.",
+  "Separate vision-capable model IDs from preferred rank so text-only ranks do not become image-routing candidates.",
+  "Bump the catalog schema to force a fresh verified catalog after the preferred model list changes; no D1 catalog writes added."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -74,7 +84,7 @@ const CONVY_RELEASE_NOTES = [
   "Removed fixed deterministic roasts in favor of fresh model-generated responses.",
   "Tightened natural Discord conversation: no unsolicited self-introduction or AI disclaimers, shorter casual replies, and continuity for relationships already established in server conversation.",
   "Merged CONVY’s adult character canon, Pune-to-Bengaluru backstory, interests, visual consistency, signature wardrobe, and explicit flirting boundaries into the built-in system prompt; these core details do not rely on the optional 5,000-character custom-instructions field.",
-  "Pinned the requested free-model order: GLM-5.3-Flash-Free, Muse-Glimmer-30B:free, then Jimmy when the live catalog confirms it is eligible.",
+  "Preferred model order is creator-configured and all listed models must still pass live free-catalog eligibility checks.",
   "Added multimodal input for Discord images and a recent-image lookup for follow-up questions.",
   "Prevented image questions from silently falling back to a text-only model.",
   "Added live model identity and request settings to the model's context.",
@@ -2012,7 +2022,7 @@ async function handleMention(env, message) {
       const selected = await setting(env.DB, "owner_selected_model_id");
       const title = selected ? "Current override: " + selected : "Current mode: AUTO, using the preferred order.";
       await sendUserReply(env, message,
-        title + "\nUse !model 1, !model 2, or !model 3 to select one of the three requested models. Use !model auto to restore automatic routing. Image requests always stay on the two vision-capable models.",
+        title + "\nUse !model 1 through !model 5 for the preferred ranking, or !model 6 through !model 15 for other listed green models. Use !model auto to restore automatic routing. Image requests stay on the explicitly configured vision-capable models.",
         message.id);
       return;
     }
@@ -2040,9 +2050,9 @@ async function handleMention(env, message) {
     let requestedId = null;
     if (numericChoice !== null && numericChoice >= 1 && numericChoice <= PREFERRED_MODEL_ORDER.length) {
       requestedId = PREFERRED_MODEL_ORDER[numericChoice - 1];
-    } else if (numericChoice !== null && numericChoice >= 4 && numericChoice <= 15) {
-      const greenOptions = extraGreenModels(pool).slice(0, 12);
-      requestedId = String(greenOptions[numericChoice - 4]?.model_id || "") || null;
+    } else if (numericChoice !== null && numericChoice >= PREFERRED_MODEL_ORDER.length + 1 && numericChoice <= 15) {
+      const greenOptions = extraGreenModels(pool).slice(0, Math.max(0, 15 - PREFERRED_MODEL_ORDER.length));
+      requestedId = String(greenOptions[numericChoice - PREFERRED_MODEL_ORDER.length - 1]?.model_id || "") || null;
     } else {
       const exact = pool.find(model => String(model.model_id || "").toLowerCase() === arg);
       if (exact && (PREFERRED_MODEL_ORDER.includes(String(exact.model_id || "")) || statusRank(exact.health) === 0)) {
@@ -2050,7 +2060,7 @@ async function handleMention(env, message) {
       }
     }
     if (!requestedId) {
-      await sendUserReply(env, message, "Use !models to see options, then !model 1 through !model 15, or !model auto. Options 4-15 are the currently listed green alternatives.", message.id);
+      await sendUserReply(env, message, "Use !models to see options, then !model 1 through !model 5 for the preferred ranking, !model 6 through !model 15 for other green alternatives, or !model auto.", message.id);
       return;
     }
     const entry = pool.find(model => String(model.model_id || "") === requestedId);
@@ -2096,10 +2106,11 @@ async function handleMention(env, message) {
           (marks ? " · **" + marks + "**" : ""));
       }
       const green = extraGreenModels(pool);
-      const visibleGreen = green.slice(0, 12);
+      const visibleGreen = green.slice(0, Math.max(0, 15 - PREFERRED_MODEL_ORDER.length));
       visibleGreen.forEach((model, index) => {
-        lines.push("**" + (index + 4) + ".** " + (catalog.stale ? "⚪" : "🟢") + " " + model.model_id +
-          (catalog.stale ? " · Cached only, not selectable" : " · Green · select with !model " + (index + 4)));
+        const choice = PREFERRED_MODEL_ORDER.length + index + 1;
+        lines.push("**" + choice + ".** " + (catalog.stale ? "⚪" : "🟢") + " " + model.model_id +
+          (catalog.stale ? " · Cached only, not selectable" : " · Green · select with !model " + choice));
       });
       if (green.length > visibleGreen.length) {
         lines.push("… plus " + (green.length - visibleGreen.length) + " more green models not numbered in this compact list.");
@@ -2113,7 +2124,7 @@ async function handleMention(env, message) {
         : "⚠️ Live catalog fetched, but snapshot saving failed. A later !model command may require another live fetch.";
       const prefix = "**CONVY models · " + buildMetadata(env).version + "** · 🟢 catalog green · 🟡 degraded · ⚠️ catalog warning · ⚪ unknown\n" +
         catalogStatus + "\n" + cacheStatus + "\n" +
-        "Preferred models are 1-3; green alternatives are 4-15. Use !model 1 through !model 15 · reset with !model auto.\n\n";
+        "Preferred ranking is 1-5; green alternatives are 6-15. Use !model 1 through !model 15 · reset with !model auto.\n\n";
       await sendUserReply(env, message, prefix + lines.join("\n"), message.id);
     } catch (error) {
       await sendUserReply(env, message,
