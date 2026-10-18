@@ -17,7 +17,7 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r5";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r6";
 const CONVY_RELEASE_NOTES = [
   "Pinned the requested free-model order: GLM-5.3-Flash-Free, Muse-Glimmer-30B:free, then Jimmy when the live catalog confirms it is eligible.",
   "Added multimodal input for Discord images and a recent-image lookup for follow-up questions.",
@@ -26,7 +26,8 @@ const CONVY_RELEASE_NOTES = [
   "Added a bounded response-settings tool for per-reply reasoning effort, temperature, and output-token budget.",
   "Compact !models now shows the three requested models plus other green models only.",
   "Added owner-only !model 1, !model 2, !model 3, and !model auto switching commands.",
-  "Simplified model status lines and capped extra green alternatives for readability."
+  "Simplified model status lines and capped extra green alternatives for readability.",
+  "Clarified that catalog health is not a live availability test and allow the creator to select a catalog-flagged model for a real request attempt."
 ];
 const RESPONSE_SETTINGS_TOOL = [{
   type: "function",
@@ -589,7 +590,7 @@ async function callFreeModel(env,db,messages,maxTokens=550) {
   ].filter((id, index, all) => all.indexOf(id) === index);
   const priority = new Map(routingOrder.map((id, index) => [id, index]));
   const candidates = pool.filter(model =>
-    statusRank(model.health) !== 2 &&
+    (statusRank(model.health) !== 2 || String(model.model_id || model.id || "") === ownerSelectedId) &&
     (!hasImages || VISION_MODEL_IDS.has(String(model.model_id || model.id || "")))
   );
   candidates.sort((a, b) => {
@@ -1308,12 +1309,6 @@ async function handleMention(env, message) {
         message.id);
       return;
     }
-    if (statusRank(entry.health) === 2) {
-      await sendUserReply(env, message,
-        "'" + requestedId + "' is currently reported down. I didn't switch to a model that is marked down. Try another model or !model auto.",
-        message.id);
-      return;
-    }
     await setSetting(env.DB, "owner_selected_model_id", requestedId);
     await sendUserReply(env, message,
       "Model override set to '" + requestedId + "'. I'll prefer it for text replies. Image requests will use it only if it's one of the two vision-capable models; otherwise I'll route those to the vision models. Use !model auto to reset.",
@@ -1338,7 +1333,7 @@ async function handleMention(env, message) {
           continue;
         }
         const health = statusRank(model.health);
-        const state = health === 0 ? "Green" : health === 1 ? "Degraded" : health === 2 ? "Down" : "Unknown";
+        const state = health === 0 ? "Green" : health === 1 ? "Degraded" : health === 2 ? "Catalog warning" : "Unknown";
         const marks = [
           ownerSelected === id ? "Selected for text" : "",
           !ownerSelected && index === 0 ? "Auto first" : "",
@@ -1358,8 +1353,8 @@ async function handleMention(env, message) {
       if (green.length > visibleGreen.length) {
         lines.push("… plus " + (green.length - visibleGreen.length) + " more green models (hidden to keep the list short).");
       }
-      const prefix = "**CONVY models** · 🟢 green · 🟡 degraded · 🔴 down · ⚪ unknown\n" +
-        "Your 3 chosen models + up to 12 other green models.\n" +
+      const prefix = "**CONVY models** · 🟢 catalog green · 🟡 degraded · ⚠️ catalog warning · ⚪ unknown\n" +
+        "Catalog health is not a live availability test. Your 3 chosen models + up to 12 other green models.\n" +
         "Switch: !model 1 / !model 2 / !model 3 · reset: !model auto\n\n";
       await sendUserReply(env, message, prefix + lines.join("\n"), message.id);
     } catch (error) {
