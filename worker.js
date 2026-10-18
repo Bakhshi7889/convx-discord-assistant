@@ -860,6 +860,28 @@ async function backfillHistory(env) {
     }
   }
 }
+function isBotMention(env, message) {
+  if (!message || message.author?.bot) return false;
+  const botId = String(env.BOT_USER_ID || "");
+  if (!/^\d{15,22}$/.test(botId)) return false;
+  return new RegExp("<@!?" + botId + ">").test(String(message.content || ""));
+}
+async function claimMentionOnce(db, message) {
+  const key = "handled_mention:" + String(message.id);
+  const result = await db.prepare(
+    "INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)"
+  ).bind(key, String(Date.now())).run();
+  return Number(result.meta?.changes || 0) > 0;
+}
+async function cleanupMentionClaims(db) {
+  const key = "mention_claim_cleanup_ms";
+  const last = Number(await setting(db, key) || 0);
+  if (Date.now() - last < 24 * 60 * 60 * 1000) return;
+  await db.prepare(
+    "DELETE FROM settings WHERE key LIKE 'handled_mention:%' AND CAST(value AS INTEGER) < ?"
+  ).bind(Date.now() - 7 * 24 * 60 * 60 * 1000).run();
+  await setSetting(db, key, Date.now());
+}
 async function pollOneChannel(env, db, channel) {
   const channelId = String(channel.id);
   const cursorKey = "last_message_id:" + channelId;
@@ -892,6 +914,20 @@ async function pollOneChannel(env, db, channel) {
     const sorted = [...batch].sort(compareSnowflakes);
     for (const message of sorted) {
       await saveMessage(env, db, message);
+      const targeted = isBotMention(env, message);
+      if (targeted) {
+        let claimed = false;
+        try { claimed = await claimMentionOnce(db, message); }
+        catch (error) {
+          console.log("Could not claim mention (" + channelId + "): " + String(error.message || error).slice(0, 120));
+        }
+        if (!claimed) {
+          // Overlapping scheduled runs can see the same input. One wins; others skip the duplicate.
+          cursor = message.id;
+          await setSetting(db, cursorKey, cursor);
+          continue;
+        }
+      }
       try {
         await handleMention(env, message);
       } catch (error) {
@@ -899,7 +935,7 @@ async function pollOneChannel(env, db, channel) {
         console.log("Mention handler failed (" + channelId + "): " + detail);
         await postAdminAlert(env, db, "mention-handler-failure", "A message handler failed; polling will continue. " + detail);
       }
-      // Advance even if one reply fails; a single bad message must not block the channel forever.
+      // Advance the cursor after one handler attempt; don't let overlapping polls duplicate it.
       cursor = message.id;
       await setSetting(db, cursorKey, cursor);
     }
@@ -910,6 +946,8 @@ async function pollOneChannel(env, db, channel) {
 async function pollNewMessages(env) {
   if (!env.DISCORD_TOKEN || !env.GUILD_ID || !env.BOT_USER_ID) return;
   const db = env.DB;
+  try { await cleanupMentionClaims(db); }
+  catch (error) { console.log("Mention-claim cleanup skipped: " + String(error.message || error).slice(0, 100)); }
 
   // List accessible guild channel definitions. Actual per-channel access is checked while polling.
   const guildChannels = await discord(env, "/guilds/" + env.GUILD_ID + "/channels");
