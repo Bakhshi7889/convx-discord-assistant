@@ -4,6 +4,7 @@ const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
 // Lazy-refresh the shared Pollinations catalog hourly in Durable Object storage, never D1.
 const MODEL_CACHE_MS = 60 * 60 * 1000;
+const MODEL_CATALOG_SCHEMA_VERSION = 3;
 const MODEL_ATTEMPT_LIMIT = 3;
 const MODEL_TIMEOUT_MS = 9000;
 // Explicit first-choice order. Models still must appear in the live catalog as eligible,
@@ -17,13 +18,24 @@ const VISION_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const SETTINGS_CAPABLE_MODEL_IDS = new Set(PREFERRED_MODEL_ORDER.slice(0, 2));
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-18-r15";
+const CONVY_BUILD_VERSION = "convx-2026-10-18-r16";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Fetch the live Pollinations community model catalog for !models and show the catalog timestamp.",
-  "Cache verified free-model catalog data and local model-performance stats in Durable Object storage with a one-hour lazy-refresh interval, eliminating model-catalog and per-attempt metrics writes to D1.",
-  "Treat stale catalog data as display-only: do not use it for model selection or new inference requests when the live catalog cannot be verified."
+  "Use Pollinations GET /models?source=community&reliability=reliable, then require health.status=healthy and explicitly zero known input/output prices.",
+  "Reject unknown or stale model catalog schemas so the previous looser reliability=all cache cannot be used for routing.",
+  "Show Discord's native typing indicator while CONVY processes addressed messages, refreshing every eight seconds and stopping when the response completes."
 ];
 const CONVY_RELEASE_HISTORY = [
+  {
+    version: "convx-2026-10-18-r15",
+    appliedAt: "2026-10-18T17:25:16.057764Z",
+    commit: "036a18d2f9b76002b948dcea85e153d7d262bc87",
+    deploymentUrl: "https://github.com/Bakhshi7889/convx-discord-assistant/actions/runs/39149462195",
+    changes: [
+      "Fetch the live Pollinations community model catalog for !models and show the catalog timestamp.",
+      "Cache verified free-model catalog data and local model-performance stats in Durable Object storage with a one-hour lazy-refresh interval, eliminating model-catalog and per-attempt metrics writes to D1.",
+      "Treat stale catalog data as display-only: do not use it for model selection or new inference requests when the live catalog cannot be verified."
+    ]
+  },
   {
     version: "convx-2026-10-18-r14",
     appliedAt: "2026-10-18T16:44:03.937201Z",
@@ -391,6 +403,48 @@ async function sendUserReply(env, message, content, replyTo = message.id, extraT
   const users = [...new Set((extraTargets?.users || []).map(String).filter(valid))];
   return sendReply(env, message.channel_id, String(content || ""), replyTo, { users, roles: [] });
 }
+
+function startTypingIndicator(env, channelId) {
+  let stopped = false;
+  let timer = null;
+  let wake = null;
+
+  const loop = (async () => {
+    while (!stopped) {
+      try {
+        await discord(env, "/channels/" + channelId + "/typing", {
+          method: "POST",
+          signal: AbortSignal.timeout(2500)
+        });
+      } catch (error) {
+        console.log("Discord typing indicator skipped: " + String(error.message || error).slice(0, 100));
+      }
+      if (stopped) break;
+      await new Promise(resolve => {
+        wake = resolve;
+        timer = setTimeout(() => {
+          timer = null;
+          wake = null;
+          resolve();
+        }, 8000);
+      });
+    }
+  })();
+
+  return async function stopTypingIndicator() {
+    stopped = true;
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (wake) {
+      const resume = wake;
+      wake = null;
+      resume();
+    }
+    await loop;
+  };
+}
 function idList(value) {
   return String(value || "").split(",").map(v => v.trim()).filter(Boolean);
 }
@@ -568,37 +622,60 @@ function modelPrices(model) {
   };
 }
 function catalogTextRatesAreFree(model) {
-  // Catalogs omit zero-rate fields on some free community models. Any positive or
-  // unparseable text-token price is rejected; missing fields count as an omitted zero.
-  const containers = [
-    model?.pricing, model?.prices, model?.costs, model?.cost,
-    ...(Array.isArray(model?.pricing_variants) ? model.pricing_variants.map(v => v?.pricing) : []),
-    model
-  ].filter(x => x && typeof x === "object" && !Array.isArray(x));
-  const rateKeys = [
-    "promptTextPrice", "prompt_text_price", "inputTextPrice", "input_text_price",
-    "promptPrice", "inputPrice", "prompt_price", "input_price",
-    "promptTextTokens", "prompt_text_tokens", "inputTextTokens", "input_text_tokens",
-    "promptCachedPrice", "prompt_cached_price", "promptCachedTokens", "prompt_cached_tokens",
-    "promptCacheWritePrice", "prompt_cache_write_price", "promptCacheWriteTokens", "prompt_cache_write_tokens",
-    "completionTextPrice", "completion_text_price", "outputTextPrice", "output_text_price",
-    "completionPrice", "outputPrice", "completion_price", "output_price",
-    "completionTextTokens", "completion_text_tokens", "completionReasoningPrice",
-    "completionReasoningTokens", "completion_reasoning_tokens", "completion_token_price", "output_token_price"
-  ];
-  let sawPricing = Boolean(model?.pricing || model?.prices || model?.costs || model?.cost);
-  if (!sawPricing) return false;
+  // Fail closed. A non-zero, malformed, or missing required text-token price is not
+  // evidence of a free model. Every other explicitly advertised usage price must also be zero.
+  const containers = [];
+  const addPricing = value => {
+    if (Array.isArray(value)) {
+      for (const item of value) addPricing(item?.pricing ?? item);
+      return;
+    }
+    if (value && typeof value === "object") containers.push(value);
+  };
+  addPricing(model?.pricing);
+  addPricing(model?.prices);
+  addPricing(model?.costs);
+  addPricing(model?.cost);
+  for (const variant of Array.isArray(model?.pricing_variants) ? model.pricing_variants : []) {
+    addPricing(variant?.pricing ?? variant);
+  }
+  if (!containers.length) return false;
+
+  const normalizeKey = key => String(key || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const inputKeys = new Set([
+    "prompttexttokens", "prompttextprice", "promptprice", "prompttokenprice",
+    "inputtexttokens", "inputtextprice", "inputprice", "inputtokenprice",
+    "prompttokens", "inputtokens", "prompt"
+  ]);
+  const outputKeys = new Set([
+    "completiontexttokens", "completiontextprice", "completionprice", "completiontokenprice",
+    "outputtexttokens", "outputtextprice", "outputprice", "outputtokenprice",
+    "completiontokens", "outputtokens", "completion"
+  ]);
+  let sawInputPrice = false;
+  let sawOutputPrice = false;
+  let sawAnyPrice = false;
+
   for (const container of containers) {
-    for (const key of rateKeys) {
-      if (!Object.prototype.hasOwnProperty.call(container, key)) continue;
-      const amount = toNumber(container[key]);
-      if (amount === null || amount > 0) return false;
+    for (const [rawKey, rawValue] of Object.entries(container)) {
+      const key = normalizeKey(rawKey);
+      if (["currency", "unit", "description", "notes", "pricingmode"].includes(key)) continue;
+      const isInput = inputKeys.has(key);
+      const isOutput = outputKeys.has(key);
+      const looksLikeRate = isInput || isOutput || /(?:price|cost|pollen|token|credit|second|image|audio|video)/i.test(key);
+      if (!looksLikeRate) continue;
+      const amount = toNumber(rawValue);
+      if (amount === null || amount !== 0) return false;
+      sawAnyPrice = true;
+      if (isInput) sawInputPrice = true;
+      if (isOutput) sawOutputPrice = true;
     }
   }
-  return true;
+  return sawAnyPrice && sawInputPrice && sawOutputPrice;
 }
 function verifiedFreeTextModel(model) {
   if (!model || model.paidOnly === true || model.paid_only === true) return false;
+  if (String(model.health?.status || "").toLowerCase() !== "healthy") return false;
   // Agent wrappers can trigger billable child calls even when the wrapper has no text rate.
   if (model.agent === true) return false;
   const id = String(model.id || model.name || "").trim();
@@ -702,7 +779,9 @@ async function readModelCatalogSnapshot(env) {
 async function models(env, force = false) {
   const now = Date.now();
   const previous = await readModelCatalogSnapshot(env);
-  const previousModels = Array.isArray(previous?.models) ? previous.models : [];
+  const previousModels = Number(previous?.schemaVersion) === MODEL_CATALOG_SCHEMA_VERSION && Array.isArray(previous?.models)
+    ? previous.models
+    : [];
   const lastSuccessfulModel = String(previous?.lastSuccessfulModel || "");
   const checkedAt = Number(previous?.checkedAt || 0);
 
@@ -720,7 +799,7 @@ async function models(env, force = false) {
   }
 
   try {
-    const response = await fetch(POLLINATIONS_API + "/text/models?source=community&reliability=all", {
+    const response = await fetch(POLLINATIONS_API + "/models?source=community&reliability=reliable", {
       headers: { "accept": "application/json" },
       signal: AbortSignal.timeout(10000)
     });
@@ -755,6 +834,7 @@ async function models(env, force = false) {
     }
 
     const snapshot = {
+      schemaVersion: MODEL_CATALOG_SCHEMA_VERSION,
       checkedAt: Date.now(),
       models: eligible,
       lastSuccessfulModel,
@@ -1530,6 +1610,8 @@ async function handleMention(env, message) {
   try { paused = await botIsPaused(env); }
   catch (error) { console.log("Pause-state read failed; continuing with bot available: " + String(error.message || error).slice(0, 100)); }
   if (paused) return;
+  const stopTyping = startTypingIndicator(env, message.channel_id);
+  try {
   if (!query) {
     await sendUserReply(env, message, "hey, I'm here. what's up?", message.id);
     return;
@@ -1969,6 +2051,9 @@ async function handleMention(env, message) {
       String(error.message || error).slice(0, 220) + "\nI will not quietly switch to a paid model. If this is urgent, ask a Convx admin now; if it keeps happening, an admin should check the Worker logs.";
     await sendUserReply(env, message, text, message.id, alert?.targets || null);
   }
+  } finally {
+    await stopTyping();
+  }
 }
 async function fetchChannelMessages(env, channelId, params) {
   const query = new URLSearchParams({ limit: "100" });
@@ -2300,6 +2385,7 @@ export class DiscordGateway extends DurableObject {
       if (!safeModels.length) return json({ ok: false, error: "No valid models were supplied." }, 400);
       const previous = await this.ctx.storage.get("model_catalog_snapshot") || {};
       const snapshot = {
+        schemaVersion: Math.max(1, Math.floor(finite(body.schemaVersion) || 1)),
         checkedAt: Math.max(0, finite(body.checkedAt)) || Date.now(),
         models: safeModels,
         lastSuccessfulModel: String(body.lastSuccessfulModel || previous.lastSuccessfulModel || "").slice(0, 300),

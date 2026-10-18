@@ -19,7 +19,7 @@ CONVY is a Discord conversational assistant running on a Cloudflare Worker with 
 
 ## Pollinations and model routing
 
-Create a server-side key at https://enter.pollinations.ai/keys and store it only as the `POLLINATIONS_API_KEY` Worker secret. The Worker reads `https://gen.pollinations.ai/text/models?source=community&reliability=all` and only calls models that pass the strict free community text-model filter. Paid-only models, models with positive or unparseable text-token prices, and agent wrappers that might call billable child models are excluded. `!models` forces a live fetch and writes no catalog rows to D1. Normal routing uses a one-hour lazy-refresh snapshot in Durable Object storage; stale catalog data is display-only and is not used to make inference requests. Catalog health is not a live guarantee.
+Create a server-side key at https://enter.pollinations.ai/keys and store it only as the `POLLINATIONS_API_KEY` Worker secret. The Worker reads `https://gen.pollinations.ai/models?source=community&reliability=reliable`, then requires `health.status === "healthy"`, a supported text chat-completions endpoint, and explicit numeric zero prices for both input and output text tokens. Any positive, malformed, or missing required price is rejected; `paid_only: false` alone is not considered proof that generation is free. `!models` forces a live fetch and writes no catalog rows to D1. Normal routing uses a one-hour lazy-refresh snapshot in Durable Object storage; old catalog schemas and stale data are not used for inference requests. Catalog health is not a live guarantee.
 
 `!models` displays the preferred models plus up to 12 alternative models. Model selection is creator-only: `!model 1` through `!model 15`, or `!model auto` to restore automatic routing. Images stay on the configured vision-capable models. Long Discord replies are split rather than silently truncated. No paid fallback is attempted if the free stack fails.
 
@@ -42,7 +42,7 @@ Worker variables:
 - `ALERT_ROLE_IDS` (optional)
 - `ALERT_CHANNEL_ID` (optional)
 
-The cron trigger runs once per minute as a Gateway recovery/supervisor hook. Normal incoming messages are handled through the persistent Gateway connection.
+The cron trigger runs once per minute as a Gateway recovery/supervisor hook. Normal incoming messages are handled through the persistent Gateway connection. Model-catalog refreshes are demand-driven, cached for one hour in the Gateway Durable Object, and do not spend D1 row writes. `!models` requests a fresh live catalog. CONVY shows Discord's native typing indicator during addressed messages, refreshes it every eight seconds while processing, and stops it once a reply or error message is sent.
 
 ## Commands
 
