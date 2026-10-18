@@ -1,6 +1,6 @@
 # Convx Discord Assistant
 
-A Cloudflare Worker + D1 Discord assistant for Convx. It polls up to 20 accessible guild channels per minute, archives messages with per-channel cursors, and replies to mentions. It answers from admin-approved knowledge first and uses Pollinations text models only when text input and output prices are explicitly zero. CONVY uses she/her and a dry, sarcastic code-reviewer voice, with playful roasts and complete, useful answers. Serious questions keep the same voice without sacrificing accuracy or care.
+A Cloudflare Worker + D1 Discord assistant for Convx. It polls up to 20 accessible guild channels per minute, archives messages with per-channel cursors, and replies to mentions. It answers from admin-approved knowledge first and uses Pollinations text models only when text input and output prices are explicitly zero. CONVY uses she/her and a concise, dryly funny code-reviewer voice without theatrical roast monologues or model-ID signatures. Explicit member roast commands use short deterministic jokes rather than an LLM-generated roast, avoiding fabricated details and gibberish. Serious questions remain accurate and careful.
 
 ## Discord setup
 
@@ -11,7 +11,7 @@ A Cloudflare Worker + D1 Discord assistant for Convx. It polls up to 20 accessib
 
 ## Pollinations setup
 
-Create a server-side secret key at https://enter.pollinations.ai/keys. Store it only as a Cloudflare Worker secret. The worker refreshes the Pollinations community text-model catalog hourly (`community=true&reliability=all`). It excludes `paid_only` models and any community model with a positive or unparseable text-token price. If the catalog provides a pricing object but omits numeric text-rate fields, those omitted rates are treated as zero, which accommodates free community entries whose rates are omitted. `!models` lists eligible models in descending score order. Scores out of 100 use provider health, provider-reported success, CONVY's measured success rate, latency, and sample confidence. Local success and latency statistics are recorded. Long Discord replies are split into separate messages instead of being silently truncated. Nonzero-priced models are never attempted, and a payment-required response never triggers a paid fallback.
+Create a server-side secret key at https://enter.pollinations.ai/keys. Store it only as a Cloudflare Worker secret. The worker refreshes the Pollinations community text-model catalog (`community=true&reliability=all`). It excludes `paid_only` models, explicitly priced text models with nonzero or unparseable rates, and agent wrappers that may call billable child models. A community model with a pricing object but no text-token rate fields is treated as zero-rate. `!models` shows only healthy/green eligible models; red/down, yellow/degraded and unknown-health models are hidden. Scores out of 100 weight provider health (20), provider success (20), smoothed CONVY success (25), Text Arena open-source model-family quality (25), and speed (10). Arena family data is a dated prior, not a guarantee about the community host. Local successes, failures and elapsed response times are recorded. Long Discord replies are split instead of silently truncated. Nonzero-priced models are never attempted, and payment-required stops fallback immediately.
 
 ## Cloudflare
 
@@ -41,8 +41,9 @@ Mention the bot in the configured channel:
 - `@Convx Assistant !list`
 - `@Convx Assistant !delete ID`
 - `@Convx Assistant !sync` (start/restart history backfill)
-- `@Convx Assistant !models`
+- `@Convx Assistant !models` (healthy/green free models only, ranked by measured health and a dated Text Arena family prior)
 - `@Convx Assistant !help`
+- `@Convx Assistant roast @member` (one-line playful roast; a real tagged member is required)
 - `@Convx Assistant save this` (admin-only: turns the latest 30 indexed messages in the current channel into one approved Q&A, with tags)
 
 Admin failure alerts ping the configured `ADMIN_USER_IDS` only, never moderator or alert roles, and are rate-limited per error type. Admin role IDs are still used to authorize admin commands. Mention parsing stays disabled except for explicitly configured bot/user/role IDs.
