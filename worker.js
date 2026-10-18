@@ -97,8 +97,10 @@ function idList(value) {
 }
 function adminMentionTargets(env) {
   const valid = values => [...new Set(values.filter(value => /^\d{15,22}$/.test(value)))];
-  return { users: valid([...idList(env.ADMIN_USER_IDS), ...idList(env.ALERT_USER_IDS)]), roles: valid([...idList(env.ADMIN_ROLE_IDS), ...idList(env.ALERT_ROLE_IDS)]) };
+  // Failure alerts ping the configured admin user(s) only. Never ping the moderator role.
+  return { users: valid(idList(env.ADMIN_USER_IDS)), roles: [] };
 }
+
 function mentionText(targets) {
   return [...(targets?.users || []).map(id => "<@" + id + ">"), ...(targets?.roles || []).map(id => "<@&" + id + ">")].join(" ");
 }
@@ -205,7 +207,6 @@ function firstPresent(objects, keys) {
   return null;
 }
 function modelPrices(model) {
-  // Pollinations has used both legacy token-rate fields and explicit *Price fields.
   const sources = [model?.pricing, model?.prices, model?.costs, model?.cost, model];
   const inputPriceKeys = [
     "promptTextPrice", "prompt_text_price", "inputTextPrice", "input_text_price",
@@ -215,31 +216,68 @@ function modelPrices(model) {
     "completionTextPrice", "completion_text_price", "outputTextPrice", "output_text_price",
     "completionPrice", "outputPrice", "completion_price", "output_price"
   ];
-  const inputLegacyKeys = [
+  const inputTokenKeys = [
     "promptTextTokens", "prompt_text_tokens", "inputTextTokens", "input_text_tokens",
+    "promptCachedTokens", "prompt_cached_tokens", "promptCacheWriteTokens", "prompt_cache_write_tokens",
     "promptText", "inputText", "textInput", "prompt_text", "input_text",
     "promptTokenPrice", "inputTokenPrice", "prompt_token_price", "input_token_price"
   ];
-  const outputLegacyKeys = [
-    "completionTextTokens", "completion_text_tokens", "completionTokenPrice", "outputTokenPrice",
+  const outputTokenKeys = [
+    "completionTextTokens", "completion_text_tokens", "completionReasoningTokens",
+    "completion_text_tokens", "completion_reasoning_tokens", "completionTokenPrice", "outputTokenPrice",
     "completion_token_price", "output_token_price", "completionText", "outputText", "textOutput",
-    "completion_text", "output_text", "completionReasoningTokens", "completion_reasoning_tokens"
+    "completion_text", "output_text"
   ];
   const inputExplicit = firstPresent(sources, inputPriceKeys);
   const outputExplicit = firstPresent(sources, outputPriceKeys);
   return {
-    input: inputExplicit === null ? firstPresent(sources, inputLegacyKeys) : inputExplicit,
-    output: outputExplicit === null ? firstPresent(sources, outputLegacyKeys) : outputExplicit
+    input: inputExplicit === null ? firstPresent(sources, inputTokenKeys) : inputExplicit,
+    output: outputExplicit === null ? firstPresent(sources, outputTokenKeys) : outputExplicit
   };
 }
-
-function verifiedFreeTextModel(model) {
-  if(!model||model.paidOnly===true||model.paid_only===true)return false;
-  const endpoints=model.supported_endpoints||model.supportedEndpoints;
-  if(Array.isArray(endpoints)&&endpoints.length&&!endpoints.some(x=>String(x).includes("/v1/chat/completions")))return false;
-  const p=modelPrices(model);
-  return p.input===0&&p.output===0;
+function catalogTextRatesAreFree(model) {
+  // Catalogs omit zero-rate fields on some free community models. Any positive or
+  // unparseable text-token price is rejected; missing fields count as an omitted zero.
+  const containers = [
+    model?.pricing, model?.prices, model?.costs, model?.cost,
+    ...(Array.isArray(model?.pricing_variants) ? model.pricing_variants.map(v => v?.pricing) : []),
+    model
+  ].filter(x => x && typeof x === "object" && !Array.isArray(x));
+  const rateKeys = [
+    "promptTextPrice", "prompt_text_price", "inputTextPrice", "input_text_price",
+    "promptPrice", "inputPrice", "prompt_price", "input_price",
+    "promptTextTokens", "prompt_text_tokens", "inputTextTokens", "input_text_tokens",
+    "promptCachedPrice", "prompt_cached_price", "promptCachedTokens", "prompt_cached_tokens",
+    "promptCacheWritePrice", "prompt_cache_write_price", "promptCacheWriteTokens", "prompt_cache_write_tokens",
+    "completionTextPrice", "completion_text_price", "outputTextPrice", "output_text_price",
+    "completionPrice", "outputPrice", "completion_price", "output_price",
+    "completionTextTokens", "completion_text_tokens", "completionReasoningPrice",
+    "completionReasoningTokens", "completion_reasoning_tokens", "completion_token_price", "output_token_price"
+  ];
+  let sawPricing = Boolean(model?.pricing || model?.prices || model?.costs || model?.cost);
+  if (!sawPricing) return false;
+  for (const container of containers) {
+    for (const key of rateKeys) {
+      if (!Object.prototype.hasOwnProperty.call(container, key)) continue;
+      const amount = toNumber(container[key]);
+      if (amount === null || amount > 0) return false;
+    }
+  }
+  return true;
 }
+function verifiedFreeTextModel(model) {
+  if (!model || model.paidOnly === true || model.paid_only === true) return false;
+  const id = String(model.id || model.name || "").trim();
+  if (!(model.community === true || id.startsWith("community/"))) return false;
+  if (model.category && String(model.category).toLowerCase() !== "text") return false;
+  if (Array.isArray(model.output_modalities) &&
+      !model.output_modalities.some(value => String(value).toLowerCase() === "text")) return false;
+  const endpoints = model.supported_endpoints || model.supportedEndpoints;
+  if (Array.isArray(endpoints) && endpoints.length &&
+      !endpoints.some(value => String(value).includes("/v1/chat/completions"))) return false;
+  return catalogTextRatesAreFree(model);
+}
+
 function catalogModels(payload) {
   if(Array.isArray(payload))return payload;
   for(const key of ["data","models","results"])if(Array.isArray(payload?.[key]))return payload[key];
@@ -290,14 +328,14 @@ async function models(db, force=false) {
     const cached=await db.prepare("SELECT model_id,source,health,success_rate,request_count,avg_latency_ms,local_success_count,local_failure_count FROM models WHERE eligible=1").all();
     return sortModelRows(cached.results||[]);
   }
-  const response=await fetch(POLLINATIONS_API+"/text/models?reliability=all",{headers:{"accept":"application/json"},signal:AbortSignal.timeout(10000)});
+  const response=await fetch(POLLINATIONS_API+"/text/models?source=community&reliability=all",{headers:{"accept":"application/json"},signal:AbortSignal.timeout(10000)});
   if(!response.ok)throw new Error("Pollinations model catalog returned HTTP "+response.status);
   const all=catalogModels(await response.json()), eligible=[];
   for(const model of all){
     if(!verifiedFreeTextModel(model))continue;
     const id=String(model.id||model.name||"").trim();if(!id)continue;
-    const h=modelHealth(model),source=String(model.source||(id.startsWith("community/")?"community":"official")).toLowerCase(),p=modelPrices(model);
-    eligible.push({id,source,status:h.status,success:h.success,requests:h.requests,input:p.input,output:p.output});
+    const h=modelHealth(model),source=String(model.source||"community").toLowerCase(),p=modelPrices(model);
+    eligible.push({id,source,status:h.status,success:h.success,requests:h.requests,input:p.input??0,output:p.output??0});
   }
   await db.prepare("UPDATE models SET eligible=0").run();
   for(const m of eligible)await db.prepare("INSERT INTO models(model_id,source,prompt_price,completion_price,health,success_rate,request_count,checked_at,eligible) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,1) ON CONFLICT(model_id) DO UPDATE SET source=excluded.source,prompt_price=excluded.prompt_price,completion_price=excluded.completion_price,health=excluded.health,success_rate=excluded.success_rate,request_count=excluded.request_count,checked_at=CURRENT_TIMESTAMP,eligible=1")
@@ -314,7 +352,7 @@ async function recordModelResult(db,id,elapsed,succeeded) {
 async function callFreeModel(env,db,messages,maxTokens=550) {
   if(!env.POLLINATIONS_API_KEY)throw new Error("Pollinations API key is not configured yet.");
   const candidates=await models(db);
-  if(!candidates.length)throw new Error("No text models with explicitly zero input and output prices were found. The catalog is cached hourly; no paid model will be used.");
+  if(!candidates.length)throw new Error("Pollinations returned no community text models with no billed text-token rates. The catalog is cached hourly; paid-only and nonzero-priced models are excluded.");
   let attempts=0;
   for(const model of candidates){
     if(attempts>=MODEL_ATTEMPT_LIMIT)break;
@@ -499,10 +537,10 @@ async function handleMention(env, message) {
       });
       const intro = "**CONVY's verified-free text model leaderboard**\n" +
         "Found " + pool.length + " model(s). Ranked by score /100: health (30), provider success (25), CONVY's observed success (25), speed (15), and provider sample confidence (5). New models get provisional scores until tested.\n" +
-        "Only models with explicitly zero input and output text prices qualify. No paid fallback. Catalog refreshed now; normal refresh is hourly.\n\n";
+        "Only community text models with no billed text-token rates qualify. Models marked paid_only or with positive/unknown text rates are excluded. No paid fallback. Catalog refreshed now; normal refresh is hourly.\n\n";
       await sendReply(env, message.channel_id,
         pool.length ? intro + lines.join("\n") :
-          "The free-model catalog returned zero models whose input and output text prices are explicitly zero. I'm not going to sneak a paid model into the queue just to make a leaderboard look impressive. Pollinations may have no verified-free text models available, or its pricing metadata may have changed. No paid model will be used.",
+          "Pollinations returned no community text models with no billed text-token rates. I'm not going to sneak a paid model into the queue just to make the leaderboard look impressive. The catalog may have changed, or the free community models may be unavailable. No paid model will be used.",
         message.id);
     } catch (error) {
       await sendReply(env, message.channel_id,
