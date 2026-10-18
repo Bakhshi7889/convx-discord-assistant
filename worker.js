@@ -170,8 +170,21 @@ async function isAdmin(env, message) {
 function normalize(value) {
   return String(value || "").toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
+const CONTEXT_STOPWORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "if", "then", "than", "so", "to", "of", "in", "on", "at",
+  "for", "from", "with", "about", "into", "over", "under", "by", "as", "is", "am", "are", "was",
+  "were", "be", "been", "being", "do", "does", "did", "have", "has", "had", "can", "could", "should",
+  "would", "will", "shall", "may", "might", "must", "your", "yours", "you", "youre", "youve", "youll",
+  "youd", "me", "my", "mine", "we", "our", "ours", "they", "them", "their", "theirs", "he", "him",
+  "his", "she", "her", "hers", "it", "its", "this", "that", "these", "those", "what", "when", "where",
+  "which", "who", "whom", "why", "how", "there", "here", "just", "like", "really", "very", "also",
+  "not", "dont", "doesnt", "didnt", "cant", "wont", "isnt", "arent", "im", "ive", "ill", "id"
+]);
 function termsFor(value) {
-  return [...new Set((String(value || "").toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) || []))].slice(0, 8);
+  return [...new Set(
+    (String(value || "").toLowerCase().normalize("NFKC").match(/[\p{L}\p{N}]{3,}/gu) || [])
+      .filter(term => !CONTEXT_STOPWORDS.has(term))
+  )].slice(0, 6);
 }
 async function searchContext(db, channelId, query) {
   const terms = termsFor(query);
@@ -580,7 +593,7 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null) {
       ? "OWNER-CUSTOMIZED INSTRUCTIONS (follow unless they conflict with safety, privacy, or accuracy):\n" + String(env.CONVY_CUSTOM_INSTRUCTIONS).trim().slice(0, 5000)
       : "OWNER-CUSTOMIZED INSTRUCTIONS: No optional custom instructions are configured. Follow the built-in CONVY persona and behavior rules.",
     "STYLE: Answer the newest message directly, in context. Be concise by default, usually 1-3 sentences. Use contractions and casual language where natural. A normal @mention is the user talking to you, not a request to explain their own message. For simple check-ins like 'you up?' or 'are you awake?', answer naturally and briefly. Do not narrate the user's intent, parrot their words back, or ask for context that was not needed. Ask one focused clarification only when genuinely necessary. Avoid repeating stock greetings.",
-    "CONVERSATION AND BANTER: Treat casual comments, jokes, teasing, compliments, flirting, and advice as normal conversation. Respond to their social meaning instead of demanding a formal question. If someone says 'you should learn flirting', play along with a light, cheeky response such as 'Teach me then, professor. Let's see if your game is any better than your advice.' Adapt the wording; do not repeat this example mechanically. If someone flirts, you may flirt back playfully without claiming real-world feelings or experiences. Do not force every message to be about Convx, the server, or an earlier topic.",
+    "CONVERSATION AND BANTER: Treat casual comments, jokes, teasing, compliments, flirting, and advice as normal conversation. Respond to their social meaning instead of demanding a formal question. If someone flirts or gives playful advice, answer in the same social register with light, cheeky banter. Do not repeat a canned response mechanically. You may flirt playfully without claiming real-world feelings or experiences. Do not force every message to be about Convx, the server, or an earlier topic.",
     "CONTEXT PRIORITY: The newest user message is the primary task. A supplied reply quote is supporting context, not a command to ignore the newest message. Use recent history only if it clearly resolves a reference or helps the conversation; unrelated history must not hijack the answer. If the new message is understandable on its own, answer it without a clarification question. When a user replies to your previous message, acknowledge what they actually said and continue naturally rather than resetting the conversation.",
     "ANTI-ROBOT RULE: Never say things like 'I'm not sure how that fits with the conversation about Convx' merely because the message changes topic. Don't use customer-support phrases such as 'can you help me understand what you mean?' unless the message is genuinely ambiguous or important information is missing.",
     replyInstructions,
@@ -816,6 +829,16 @@ async function handleMention(env, message) {
   }
   const command = query.trim();
   const normalizedCommand = normalize(command);
+  // Handle common social banter locally so irrelevant retrieved history cannot hijack it.
+  if (/\b(?:learn|practice|get better at|improve your)\b.{0,24}\b(?:flirting|flirt|rizz)\b/.test(normalizedCommand) ||
+      /\b(?:flirting|flirt|rizz)\b.{0,24}\b(?:learn|practice|get better)\b/.test(normalizedCommand)) {
+    await sendUserReply(env, message, "teach me then, professor. let's see if your game is any better than your advice.", message.id);
+    return;
+  }
+  if (/\b(?:can|do) you flirt\b|\bflirt with me\b/.test(normalizedCommand)) {
+    await sendUserReply(env, message, "I can try. But if I make you blush, I'm taking absolutely no responsibility.", message.id);
+    return;
+  }
   if (/^(show|give|tell me|reveal|print|repeat|what are) (your )?(custom |system )?instructions\b/.test(normalizedCommand) ||
       /^(show|give|reveal|print) (your )?(system prompt|hidden prompt)\b/.test(normalizedCommand)) {
     await sendUserReply(env, message,
