@@ -213,6 +213,115 @@ async function searchWeb(query) {
   } catch {}
   return [];
 }
+async function searchWikimediaImages(query) {
+  const q = String(query || "").trim().slice(0, 300);
+  if (!q) return [];
+  const params = new URLSearchParams({
+    action: "query", generator: "search", gsrsearch: "filetype:bitmap " + q,
+    gsrnamespace: "6", gsrlimit: "5", prop: "imageinfo",
+    iiprop: "url|extmetadata", iiurlwidth: "800", format: "json", origin: "*"
+  });
+  const response = await fetch("https://commons.wikimedia.org/w/api.php?" + params.toString(), {
+    headers: { "User-Agent": "CONVY-Discord-Assistant/1.0 (Wikimedia Commons image search)", "Accept": "application/json" },
+    signal: AbortSignal.timeout(7000)
+  });
+  if (!response.ok) throw new Error("Wikimedia Commons search returned HTTP " + response.status);
+  const data = await response.json();
+  const pages = Object.values(data?.query?.pages || {}).sort((a, b) => Number(a.index || 0) - Number(b.index || 0));
+  return pages.map(page => {
+    const info = page.imageinfo?.[0] || {};
+    const meta = info.extmetadata || {};
+    const htmlValue = key => decodeHtml(meta[key]?.value || "");
+    const license = htmlValue("LicenseShortName");
+    const artist = htmlValue("Artist");
+    const imageUrl = String(info.thumburl || info.url || "");
+    const title = String(page.title || "Wikimedia Commons image").replace(/^File:/, "");
+    const pageUrl = "https://commons.wikimedia.org/wiki/" + encodeURIComponent(String(page.title || "").replace(/ /g, "_"));
+    return {
+      title: title.slice(0, 220), imageUrl, pageUrl, source: "Wikimedia Commons",
+      license: license.slice(0, 100), credit: artist.slice(0, 180)
+    };
+  }).filter(item => /^https:\/\//i.test(item.imageUrl) && /^https:\/\//i.test(item.pageUrl)).slice(0, 5);
+}
+async function searchWebImages(query) {
+  const q = String(query || "").trim().slice(0, 300);
+  if (!q) return [];
+  // DuckDuckGo's image endpoint needs no API key but is unofficial and may change.
+  // Wikimedia Commons provides a public API fallback with source/credit links.
+  try {
+    const tokenUrl = "https://duckduckgo.com/?q=" + encodeURIComponent(q) + "&iax=images&ia=images";
+    const tokenResponse = await fetch(tokenUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; CONVY-Discord-Assistant/1.0)", "Accept": "text/html" },
+      signal: AbortSignal.timeout(7000)
+    });
+    if (tokenResponse.ok) {
+      const tokenHtml = await tokenResponse.text();
+      const tokenMatch = tokenHtml.match(/\bvqd=([\d-]{5,})/i) || tokenHtml.match(/["']vqd["']\s*:\s*["']([\d-]{5,})["']/i);
+      if (tokenMatch?.[1]) {
+        const params = new URLSearchParams({
+          l: "us-en", o: "json", q, vqd: tokenMatch[1], f: ",,,", p: "1", kp: "1", v7exp: "a"
+        });
+        const response = await fetch("https://duckduckgo.com/i.js?" + params.toString(), {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (compatible; CONVY-Discord-Assistant/1.0)",
+            "Accept": "application/json, text/javascript, */*",
+            "Referer": "https://duckduckgo.com/",
+            "X-Requested-With": "XMLHttpRequest"
+          },
+          signal: AbortSignal.timeout(7000)
+        });
+        if (response.ok) {
+          const data = await response.json();
+          const results = (Array.isArray(data?.results) ? data.results : []).map(item => ({
+            title: String(item.title || item.source || "Image result").slice(0, 220),
+            imageUrl: String(item.image || item.thumbnail || ""),
+            pageUrl: String(item.url || item.source_url || ""),
+            source: String(item.source || "DuckDuckGo image result"),
+            license: "",
+            credit: ""
+          })).filter(item => /^https:\/\//i.test(item.imageUrl) && /^https:\/\//i.test(item.pageUrl));
+          if (results.length) return results.slice(0, 5);
+        }
+      }
+    }
+  } catch (error) {
+    console.log("DuckDuckGo image search unavailable; trying Commons fallback: " + String(error.message || error).slice(0, 100));
+  }
+  return searchWikimediaImages(q);
+}
+async function sendImageSearchReply(env, message, query, results) {
+  if (!Array.isArray(results) || !results.length) {
+    await sendUserReply(env, message, "I couldn't find usable image previews for **" + String(query || "").slice(0, 150) + "**. Try a more specific search, or use !search for ordinary web sources.", message.id);
+    return;
+  }
+  const embeds = results.slice(0, 3).map(item => {
+    const description = [
+      item.source || "Web image result",
+      item.credit ? "Credit: " + item.credit : "",
+      item.license ? "License: " + item.license : "",
+      item.pageUrl ? "Original: " + item.pageUrl : ""
+    ].filter(Boolean).join("\n").slice(0, 900);
+    return {
+      title: String(item.title || "Image result").slice(0, 240),
+      ...(item.pageUrl ? { url: item.pageUrl } : {}),
+      description,
+      image: { url: item.imageUrl }
+    };
+  });
+  const sent = await discord(env, "/channels/" + message.channel_id + "/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      content: "**Image results for:** " + String(query || "").slice(0, 180) + "\nImages are embedded from their source hosts; open a result to visit the original page.",
+      message_reference: { message_id: message.id, fail_if_not_exists: false },
+      embeds,
+      allowed_mentions: { parse: [] }
+    })
+  });
+  try { await appendConversationMessage(env, sent); }
+  catch (error) { console.log("Image result context write skipped: " + String(error.message || error).slice(0, 100)); }
+  try { await saveMessage(env, env.DB, sent); }
+  catch (error) { console.log("Image result history write skipped: " + String(error.message || error).slice(0, 100)); }
+}
 function wantsWebSearch(query, force = false) {
   return Boolean(force) || /\b(?:search(?:\s+the)?\s+(?:web|internet|online)|web\s+search|google(?:\s+it)?|look\s+(?:it\s+)?up(?:\s+online)?|find\s+(?:this\s+)?online|browse\s+(?:the\s+)?web|verify\s+online|latest|current|today|this\s+week|recent\s+news|breaking\s+news|price\s+right\s+now|check\s+(?:the\s+)?official\s+site)\b/i.test(String(query || ""));
 }
@@ -1412,6 +1521,24 @@ async function handleMention(env, message) {
     }
     return;
   }
+  if (command === "!images" || command.startsWith("!images ")) {
+    const imageQuery = command.slice("!images".length).trim();
+    if (!imageQuery) {
+      await sendUserReply(env, message, "Use !images followed by what you want to see, for example !images Bengaluru street photography.", message.id);
+      return;
+    }
+    if ((await setting(env.DB, "web_search_enabled")) === "off") {
+      await sendUserReply(env, message, "Web search is disabled by the creator.", message.id);
+      return;
+    }
+    try {
+      const results = await searchWebImages(imageQuery);
+      await sendImageSearchReply(env, message, imageQuery, results);
+    } catch (error) {
+      await sendUserReply(env, message, "Image search failed: " + String(error.message || error).slice(0, 160), message.id);
+    }
+    return;
+  }
   if (command === "!search" || command.startsWith("!search ")) {
     const searchQuery = command.slice("!search".length).trim();
     if (!searchQuery) {
@@ -1450,7 +1577,7 @@ async function handleMention(env, message) {
       "Temperature: " + (temperature || "AUTO per message") + "\n" +
       "Max tokens: " + (maxTokens || "AUTO per message") + "\n" +
       "Web search: " + (webEnabled ? "on" : "off") + "\n\n" +
-      "Commands: !model 1-15|auto, !reasoning low|medium|high|auto, !temperature 0-1|auto, !maxtokens 100-900|auto, !web on|off, !pause, !start, !memory, !context, !inspect @member, !search query.",
+      "Commands: !model 1-15|auto, !reasoning low|medium|high|auto, !temperature 0-1|auto, !maxtokens 100-900|auto, !web on|off, !pause, !start, !memory, !context, !inspect @member, !search query, !images query, !version, !changes.",
       message.id);
     return;
   }
@@ -1609,7 +1736,7 @@ async function handleMention(env, message) {
   if (command === "!help") {
     await sendUserReply(env, message,
       "Mention me with a question or reply to one of my messages to continue the conversation. I keep recent channel context, and the creator can save long-term memories.\n\n" +
-      "**Creator controls:** !pause, !start, !config, !model 1-15|auto, !reasoning low|medium|high|auto, !temperature 0-1|auto, !maxtokens 100-900|auto, !web on|off, !remember fact, !memory, !forget ID, !context, !inspect @member, !search query.\n\n" +
+      "**Creator controls:** !pause, !start, !config, !model 1-15|auto, !reasoning low|medium|high|auto, !temperature 0-1|auto, !maxtokens 100-900|auto, !web on|off, !remember fact, !memory, !forget ID, !context, !inspect @member, !search query, !images query, !version, !changes.\n\n" +
       "**Admin commands:** !add question | answer | tags, !list, !delete ID, !sync, !models, !runtime, save this.", message.id);
     return;
   }
