@@ -35,11 +35,11 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-20-r26";
+const CONVY_BUILD_VERSION = "convx-2026-10-20-r28";
 const CONVY_CURRENT_RELEASE_NOTES = [
   "Keep CONVY's established independent persona and ordinary conversation behavior.",
-  "Try additional OpenRouter models only after verifying the :free label and zero text-token pricing when LFM is unavailable.",
-  "Shorten user-facing provider errors and preserve detailed failure reasons in Worker logs."
+  "Handle OpenRouter JSON and server-sent-event completion responses, and discover verified-free OpenRouter alternatives if LFM fails.",
+  "Shorten user-facing provider errors and preserve structured failure diagnostics without logging response text."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -1438,6 +1438,57 @@ function openRouterErrorDetail(value) {
   return String(value || "").replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").slice(0, 170);
 }
 
+function parseOpenRouterSSE(rawBody) {
+  const rows = new Map();
+  let firstPayload = null;
+  let usage = null;
+  let sawChunk = false;
+  for (const line of String(rawBody || "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+    let chunk;
+    try { chunk = JSON.parse(data); } catch { continue; }
+    sawChunk = true;
+    if (!firstPayload) firstPayload = chunk;
+    if (chunk?.error) return chunk;
+    if (chunk?.usage) usage = chunk.usage;
+    for (const choice of Array.isArray(chunk?.choices) ? chunk.choices : []) {
+      const index = Number(choice.index) || 0;
+      if (!rows.has(index)) rows.set(index, { role: "assistant", content: "", toolCalls: new Map(), finish_reason: null });
+      const row = rows.get(index);
+      const delta = choice.delta || {};
+      if (typeof delta.role === "string") row.role = delta.role;
+      if (typeof delta.content === "string") row.content += delta.content;
+      else if (Array.isArray(delta.content)) {
+        row.content += delta.content.filter(part => part?.type === "text" && typeof part.text === "string").map(part => part.text).join("");
+      }
+      if (typeof choice.finish_reason === "string") row.finish_reason = choice.finish_reason;
+      for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+        const callIndex = Number(call.index) || 0;
+        if (!row.toolCalls.has(callIndex)) row.toolCalls.set(callIndex, { id: "", type: "function", function: { name: "", arguments: "" } });
+        const item = row.toolCalls.get(callIndex);
+        if (call.id) item.id = String(call.id);
+        if (call.type) item.type = String(call.type);
+        if (call.function?.name) item.function.name += String(call.function.name);
+        if (call.function?.arguments) item.function.arguments += String(call.function.arguments);
+      }
+    }
+  }
+  if (!sawChunk || !firstPayload || !rows.size) return null;
+  const choices = [...rows.entries()].sort((a, b) => a[0] - b[0]).map(([index, row]) => ({
+    index,
+    message: {
+      role: row.role,
+      content: row.content || null,
+      ...(row.toolCalls.size ? { tool_calls: [...row.toolCalls.entries()].sort((a, b) => a[0] - b[0]).map(([toolIndex, call]) => ({ ...call, index: toolIndex })) } : {})
+    },
+    finish_reason: row.finish_reason
+  }));
+  return { ...firstPayload, choices, ...(usage ? { usage } : {}) };
+}
+
 async function openRouterCompletion(env, modelId, messages, settings, ownerSelectedId, useTools) {
   const requestMessages = withRuntimeSnapshot(env, messages, modelId, settings, false, Boolean(useTools), ownerSelectedId);
   const body = {
@@ -1494,10 +1545,30 @@ async function openRouterCompletion(env, modelId, messages, settings, ownerSelec
     }
 
     let payload;
-    try { payload = await response.json(); }
-    catch {
-      const failure = new Error("OpenRouter returned an invalid JSON completion response.");
-      failure.status = 200;
+    let rawBody = "";
+    try {
+      rawBody = await response.text();
+      try {
+        payload = JSON.parse(rawBody);
+      } catch {
+        payload = parseOpenRouterSSE(rawBody);
+        if (!payload) {
+          console.log(JSON.stringify({
+            event: "openrouter_nonjson_response",
+            model: modelId,
+            http_status: response.status,
+            content_type: String(response.headers.get("content-type") || "").slice(0, 100),
+            body_length: rawBody.length
+          }));
+          const failure = new Error("OpenRouter returned a non-JSON, non-stream completion response.");
+          failure.status = 502;
+          throw failure;
+        }
+      }
+    } catch (error) {
+      if (error?.status) throw error;
+      const failure = new Error("OpenRouter response body could not be read.");
+      failure.status = 502;
       throw failure;
     }
     if (payload?.error) {
