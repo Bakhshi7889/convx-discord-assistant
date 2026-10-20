@@ -17,6 +17,19 @@ CONVY is a Discord conversational assistant running on a Cloudflare Worker with 
 3. Under **OAuth2 → URL Generator**, select `bot` and `applications.commands`. Grant View Channel and Read Message History in channels the bot should monitor, Send Messages in ordinary text/announcement channels, and Send Messages in Threads for thread replies, including forum/media posts. Then invite it to Convx.
 4. Set the bot ID, guild ID, target channel ID, admin role IDs, and your own Discord user ID in the Worker variables. Enable Developer Mode in Discord to copy IDs.
 
+## GitHub issue creation for Convx
+
+CONVY can create issues in the product repository `cosmictaserdev-creator/Convx` through an admin-only Discord `/issue` command. The command opens a title/description modal, searches open issues for likely duplicates, shows a private preview, and only creates the issue after the requester confirms. The issue body includes the Discord requester's display name and user ID for attribution. Drafts expire after 10 minutes, a confirmation can only be consumed once, and issue creation is limited to five confirmed issues per requester per hour.
+
+### Required setup
+
+1. In Cloudflare Worker settings, add `GITHUB_ISSUES_TOKEN` as a **secret**. Use a fine-grained GitHub token with `Issues: read and write` on `cosmictaserdev-creator/Convx` (plus the required repository metadata access). The token's owner must already have permission to create issues in that repository. Never put this token in Discord, source code, `wrangler.toml`, or a commit.
+2. Add `DISCORD_PUBLIC_KEY` as a Worker secret/value using the 64-character hex **Public Key** from Discord Developer Portal → General Information. This value is public metadata, but keeping it in Worker configuration helps preserve it across deployments.
+3. In Discord Developer Portal → General Information, set **Interactions Endpoint URL** to `https://convx-discord-assistant.herobakhshi-c26.workers.dev/interactions`. Discord will verify the Ed25519 signature and ping using the configured public key; unsigned requests are rejected.
+4. After the new Worker is deployed and the two values are set, send `@CONVY !registerissue` in the configured server as the bot creator. This creates or updates only the `/issue` guild command without overwriting the app's other commands. Then use `/issue` in the server.
+
+The Worker health endpoint shows only booleans for the public key and GitHub token; it never returns credential values. GitHub duplicate-check failures are fail-closed: if CONVY cannot search for possible duplicates, it won't create the issue.
+
 ## Model providers and routing
 
 ### Primary: OpenRouter
