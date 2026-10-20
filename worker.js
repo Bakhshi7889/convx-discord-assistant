@@ -35,11 +35,11 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-20-r29";
+const CONVY_BUILD_VERSION = "convx-2026-10-20-r30";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Keep CONVY's established independent persona and ordinary conversation behavior.",
-  "Increase the OpenRouter response timeout to reduce false failures on slow completions.",
-  "Handle JSON and server-sent-event completions, try only verified-free OpenRouter alternatives, and keep Discord error replies short."
+  "Keep CONVY's established independent persona, creator commands, message deduplication, and channel memory.",
+  "Use 3.5-second fast web search with fewer results.",
+  "Schedule channel replies at least two seconds apart, with up to five concurrent generations per channel and no per-user cooldown."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -254,7 +254,7 @@ async function searchWeb(query) {
   if (!q) return [];
   const response = await fetch("https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q), {
     headers: { "User-Agent": "Mozilla/5.0 (compatible; CONVY-Discord-Assistant/1.0)", "Accept": "text/html" },
-    signal: AbortSignal.timeout(7000)
+    signal: AbortSignal.timeout(3500)
   });
   if (!response.ok) throw new Error("Web search returned HTTP " + response.status);
   const html = await response.text(), anchors = [];
@@ -270,7 +270,7 @@ async function searchWeb(query) {
     } catch {}
     if (!/^https?:\/\//i.test(target) || /duckduckgo\.com\/(?:y\.js|ac\/|feedback)/i.test(target)) continue;
     anchors.push({ url: target, title: decodeHtml(match[2]).slice(0, 220), index: match.index + match[0].length });
-    if (anchors.length >= 5) break;
+    if (anchors.length >= 3) break;
   }
   const results = anchors.map((item, index) => {
     const end = index + 1 < anchors.length ? Math.min(anchors[index + 1].index, item.index + 1800) : item.index + 1800;
@@ -3004,6 +3004,10 @@ export class DiscordGateway extends DurableObject {
     this.lastError = "";
     this.inFlightMessages = new Set();
     this.contextWriteChain = Promise.resolve();
+    this.channelQueues = new Map();
+    this.channelActive = new Map();
+    this.channelLastStartedAt = new Map();
+    this.channelQueueTimers = new Map();
   }
 
   async fetch(request) {
@@ -3382,6 +3386,56 @@ export class DiscordGateway extends DurableObject {
     await this.contextWriteChain;
   }
 
+  enqueueChannelMessage(message) {
+    const channelId = String(message?.channel_id || "");
+    if (!channelId) return Promise.resolve();
+    return new Promise(resolve => {
+      if (!this.channelQueues.has(channelId)) this.channelQueues.set(channelId, []);
+      this.channelQueues.get(channelId).push({ message, resolve });
+      this.pumpChannelQueue(channelId);
+    });
+  }
+
+  pumpChannelQueue(channelId) {
+    const queue = this.channelQueues.get(channelId);
+    if (!queue?.length) {
+      this.channelQueues.delete(channelId);
+      return;
+    }
+    if ((this.channelActive.get(channelId) || 0) >= 5) return;
+    const wait = Math.max(0, 2000 - (Date.now() - (this.channelLastStartedAt.get(channelId) || 0)));
+    if (wait > 0) {
+      if (!this.channelQueueTimers.has(channelId)) {
+        this.channelQueueTimers.set(channelId, setTimeout(() => {
+          this.channelQueueTimers.delete(channelId);
+          this.pumpChannelQueue(channelId);
+        }, wait));
+      }
+      return;
+    }
+    const item = queue.shift();
+    if (!queue.length) this.channelQueues.delete(channelId);
+    this.channelActive.set(channelId, (this.channelActive.get(channelId) || 0) + 1);
+    this.channelLastStartedAt.set(channelId, Date.now());
+    Promise.resolve().then(() => handleMention(this.env, item.message)).catch(async error => {
+      const detail = String(error?.message || error).slice(0, 160);
+      console.log("Queued mention handler failed (" + channelId + "): " + detail);
+      try { await postAdminAlert(this.env, this.env.DB, "mention-handler-failure", "A message handler failed; the queue will continue. " + detail); } catch {}
+    }).finally(() => {
+      item.resolve();
+      const active = Math.max(0, (this.channelActive.get(channelId) || 1) - 1);
+      if (active) this.channelActive.set(channelId, active);
+      else this.channelActive.delete(channelId);
+      this.pumpChannelQueue(channelId);
+    });
+    if (this.channelQueues.get(channelId)?.length && !this.channelQueueTimers.has(channelId)) {
+      this.channelQueueTimers.set(channelId, setTimeout(() => {
+        this.channelQueueTimers.delete(channelId);
+        this.pumpChannelQueue(channelId);
+      }, 2000));
+    }
+  }
+
   async processMessage(message) {
     if (!message || message.guild_id !== String(this.env.GUILD_ID || "")) return;
     const isOwnBotMessage = Boolean(message.author?.bot && String(message.author.id) === String(this.env.BOT_USER_ID || ""));
@@ -3418,7 +3472,12 @@ export class DiscordGateway extends DurableObject {
       catch (error) {
         console.log("Message history write skipped: " + String(error.message || error).slice(0, 120));
       }
-      await handleMention(this.env, message);
+      // Creator commands bypass conversational throttling; ordinary mentions are queued.
+      const contentWithoutMention = String(message.content || "").replace(
+        new RegExp("<@!?" + String(this.env.BOT_USER_ID || "") + ">"), ""
+      ).trim();
+      if (isCreator(message) && /^!/.test(contentWithoutMention)) await handleMention(this.env, message);
+      else await this.enqueueChannelMessage(message);
     } finally {
       this.inFlightMessages.delete(messageId);
     }
