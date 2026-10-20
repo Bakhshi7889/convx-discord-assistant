@@ -3431,6 +3431,105 @@ export class DiscordGateway extends DurableObject {
         lastError: await this.ctx.storage.get("gateway_last_error") || this.lastError || null
       });
     }
+    if (path === "/issues/draft" && request.method === "POST") {
+      let draft = {};
+      try { draft = await request.json(); } catch {}
+      const draftId = String(draft.draftId || "");
+      const userId = String(draft.userId || "");
+      const title = String(draft.title || "").trim();
+      const body = String(draft.body || "").trim();
+      if (!/^[0-9a-f-]{36}$/i.test(draftId) || !/^\d{15,22}$/.test(userId) ||
+          title.length < 5 || title.length > 120 || body.length < 10 || body.length > 4000) {
+        return json({ ok: false, error: "Invalid issue draft." }, 400);
+      }
+      const key = "issue_draft:" + draftId;
+      if (await this.ctx.storage.get(key)) return json({ ok: false, error: "Draft already exists." }, 409);
+      const safeDraft = {
+        draftId, userId, title, body,
+        requesterName: String(draft.requesterName || "Discord user").slice(0, 100),
+        duplicates: Array.isArray(draft.duplicates) ? draft.duplicates.slice(0, 3).map(item => ({
+          number: Math.max(0, Number(item?.number) || 0),
+          title: String(item?.title || "").slice(0, 180),
+          html_url: String(item?.html_url || "").slice(0, 500)
+        })) : [],
+        createdAt: Date.now(),
+        expiresAt: Date.now() + ISSUE_DRAFT_TTL_MS,
+        status: "pending"
+      };
+      await this.ctx.storage.put(key, safeDraft, { expirationTtl: Math.ceil(ISSUE_DRAFT_TTL_MS / 1000) });
+      return json({ ok: true, expiresAt: safeDraft.expiresAt });
+    }
+    if (path === "/issues/draft" && request.method === "GET") {
+      const url = new URL(request.url);
+      const draftId = String(url.searchParams.get("draft_id") || "");
+      const userId = String(url.searchParams.get("user_id") || "");
+      if (!/^[0-9a-f-]{36}$/i.test(draftId) || !/^\d{15,22}$/.test(userId)) return json({ ok: false, error: "Invalid draft lookup." }, 400);
+      const key = "issue_draft:" + draftId;
+      const draft = await this.ctx.storage.get(key);
+      if (!draft || Number(draft.expiresAt) < Date.now()) {
+        if (draft) await this.ctx.storage.delete(key);
+        return json({ ok: false, error: "Issue draft expired." }, 404);
+      }
+      if (String(draft.userId) !== userId) return json({ ok: false, error: "This issue draft belongs to another requester." }, 403);
+      return json({ ok: true, draft });
+    }
+    if (path === "/issues/draft/claim" && request.method === "POST") {
+      let input = {};
+      try { input = await request.json(); } catch {}
+      const draftId = String(input.draftId || "");
+      const userId = String(input.userId || "");
+      if (!/^[0-9a-f-]{36}$/i.test(draftId) || !/^\d{15,22}$/.test(userId)) return json({ ok: false, error: "Invalid issue confirmation." }, 400);
+      const key = "issue_draft:" + draftId;
+      const result = await this.ctx.storage.transaction(async txn => {
+        const draft = await txn.get(key);
+        if (!draft || Number(draft.expiresAt) < Date.now()) return { ok: false, error: "Issue draft expired." };
+        if (String(draft.userId) !== userId) return { ok: false, error: "This draft belongs to another requester." };
+        if (draft.status !== "pending") return { ok: false, error: "Issue draft was already confirmed or cancelled." };
+        const rateKey = "issue_create_rate:" + userId;
+        const timestamps = (await txn.get(rateKey) || []).filter(value => Number(value) > Date.now() - ISSUE_CREATE_RATE_WINDOW_MS);
+        if (timestamps.length >= ISSUE_CREATE_RATE_LIMIT) return { ok: false, error: "Issue creation rate limited to five per hour." };
+        timestamps.push(Date.now());
+        await txn.put(rateKey, timestamps);
+        draft.status = "creating";
+        draft.claimedAt = Date.now();
+        await txn.put(key, draft);
+        return { ok: true, draft };
+      });
+      return json(result, result.ok ? 200 : result.error.includes("rate limited") ? 429 : result.error.includes("another requester") ? 403 : 409);
+    }
+    if (path === "/issues/draft/complete" && request.method === "POST") {
+      let input = {};
+      try { input = await request.json(); } catch {}
+      const draftId = String(input.draftId || "");
+      const userId = String(input.userId || "");
+      const key = "issue_draft:" + draftId;
+      const result = await this.ctx.storage.transaction(async txn => {
+        const draft = await txn.get(key);
+        if (!draft || String(draft.userId) !== userId || draft.status !== "creating") return { ok: false };
+        draft.status = "created";
+        draft.issueNumber = Math.max(0, Number(input.issueNumber) || 0);
+        draft.issueUrl = String(input.issueUrl || "").slice(0, 500);
+        draft.body = "";
+        await txn.put(key, draft);
+        return { ok: true };
+      });
+      return json(result, result.ok ? 200 : 409);
+    }
+    if (path === "/issues/draft/cancel" && request.method === "POST") {
+      let input = {};
+      try { input = await request.json(); } catch {}
+      const draftId = String(input.draftId || "");
+      const userId = String(input.userId || "");
+      const key = "issue_draft:" + draftId;
+      const result = await this.ctx.storage.transaction(async txn => {
+        const draft = await txn.get(key);
+        if (!draft) return { ok: true };
+        if (String(draft.userId) !== userId || draft.status !== "pending") return { ok: false };
+        await txn.delete(key);
+        return { ok: true };
+      });
+      return json(result, result.ok ? 200 : 409);
+    }
     return json({ error: "Not found" }, 404);
   }
 
