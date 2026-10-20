@@ -2575,11 +2575,11 @@ async function handleMention(env, message) {
     await sendUserReply(env, message,
       "**Provider diagnostics**\n" +
       "Build: " + CONVY_BUILD_VERSION + "\n" +
-      "Primary provider env: " + provider + "\\n" +
-      "Configured OpenRouter model: " + modelId + "\\n" +
-      "OpenRouter key present: " + (hasKey ? "yes (value hidden)" : "NO") + "\\n" +
-      "Cached free-price verification: " + statusText + "\\n" +
-      "Manual model override: " + (selected || "none, automatic primary routing") + "\\n" +
+      "Primary provider env: " + provider + "\n" +
+      "Configured OpenRouter model: " + modelId + "\n" +
+      "OpenRouter key present: " + (hasKey ? "yes (value hidden)" : "NO") + "\n" +
+      "Cached free-price verification: " + statusText + "\n" +
+      "Manual model override: " + (selected || "none, automatic primary routing") + "\n" +
       "Routing note: explicit model overrides use Pollinations; image requests currently use Pollinations vision models. Check Worker logs for the exact provider/model event.",
       message.id);
     return;
