@@ -961,10 +961,12 @@ async function issueConversationClaim(env, channelId, userId, action) {
 async function createIssueFromConversation(env, message) {
   const channelId = String(message.channel_id), userId = String(message.author.id);
   let claim;
+  let didClaim = false;
   try {
     claim = await issueConversationClaim(env, channelId, userId, "create");
     const state = claim?.state;
     if (!state) throw new Error("This issue draft expired.");
+    didClaim = true;
     const issueBody = String(state.body || "") + "\n\n---\n*Submitted via CONVY by " +
       String(state.requesterName || issueReporterName(message)).replace(/[\r\n]+/g, " ").slice(0, 100) +
       " (Discord user ID: " + userId + ").*";
@@ -975,25 +977,29 @@ async function createIssueFromConversation(env, message) {
     await clearIssueConversation(env, channelId, userId);
     await sendUserReply(env, message, "Created [#" + result.number + " " + String(result.title || state.title).slice(0, 160) + "](" + result.html_url + ") in Convx.", message.id);
   } catch (error) {
-    await gatewayControl(env, "/issues/conversation/reset", {
+    const detail = String(error.message || error);
+    if (didClaim) await gatewayControl(env, "/issues/conversation/reset", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ channelId, userId, action: "create" })
     }).catch(() => {});
-    const detail = String(error.message || error);
-    const text = detail.includes("rate limited")
-      ? "You've reached the issue creation limit for this hour. Try again later."
-      : detail.includes("HTTP 401") || detail.includes("HTTP 403")
-        ? "GitHub denied issue creation. Check the token's Issues: write access to Convx."
-        : "I couldn't create that issue. Your draft is still available; try confirming again in a moment.";
+    const text = detail.includes("already in progress")
+      ? "I'm already processing that issue. Give me a moment to finish."
+      : detail.includes("rate limited")
+        ? "You've reached the issue creation limit for this hour. Try again later."
+        : detail.includes("HTTP 401") || detail.includes("HTTP 403")
+          ? "GitHub denied issue creation. Check the token's Issues: write access to Convx."
+          : "I couldn't create that issue. Your draft is still available; try confirming again in a moment.";
     console.log("Natural Convx issue creation failed: " + detail.slice(0, 180));
     await sendUserReply(env, message, text, message.id);
   }
 }
 async function addCommentFromConversation(env, message, state) {
   const channelId = String(message.channel_id), userId = String(message.author.id);
+  let didClaim = false;
   try {
     const claim = await issueConversationClaim(env, channelId, userId, "comment");
     if (!claim?.state) throw new Error("The comment draft expired.");
+    didClaim = true;
     const draft = claim.state;
     const issue = await verifyConvxIssue(env, draft.commentIssueNumber);
     const result = await githubIssuesRequest(env,
@@ -1006,16 +1012,18 @@ async function addCommentFromConversation(env, message, state) {
     await clearIssueConversation(env, channelId, userId);
     await sendUserReply(env, message, "Added your comment to [#" + issue.number + " " + issue.title + "](" + issue.html_url + "). [View comment](" + result.html_url + ")", message.id);
   } catch (error) {
-    await gatewayControl(env, "/issues/conversation/reset", {
+    const detail = String(error.message || error);
+    if (didClaim) await gatewayControl(env, "/issues/conversation/reset", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ channelId, userId, action: "comment" })
     }).catch(() => {});
-    const detail = String(error.message || error);
-    const text = detail.includes("rate limited")
-      ? "You've reached the comment limit for this hour. Try again later."
-      : detail.includes("HTTP 401") || detail.includes("HTTP 403")
-        ? "GitHub denied the comment. Check the token's Issues: write access to Convx."
-        : "I couldn't add the comment. Your draft is still available; try confirming again.";
+    const text = detail.includes("already in progress")
+      ? "I'm already processing that comment. Give me a moment to finish."
+      : detail.includes("rate limited")
+        ? "You've reached the comment limit for this hour. Try again later."
+        : detail.includes("HTTP 401") || detail.includes("HTTP 403")
+          ? "GitHub denied the comment. Check the token's Issues: write access to Convx."
+          : "I couldn't add the comment. Your draft is still available; try confirming again.";
     console.log("Natural Convx issue comment failed: " + detail.slice(0, 180));
     await sendUserReply(env, message, text, message.id);
   }
