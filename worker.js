@@ -41,12 +41,12 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-20-r33";
+const CONVY_BUILD_VERSION = "convx-2026-10-20-r34";
 const CONVY_CURRENT_RELEASE_NOTES = [
   "Keep CONVY's independent persona, normal chat, message deduplication, and channel memory.",
-  "Support natural-language issue requests and relevant bug reports without requiring a bang command.",
-  "Search related Convx issues, offer safe comment/new-issue choices, and require explicit confirmation before writing to GitHub.",
-  "Prevent overlapping confirmations from resetting an in-progress GitHub write."
+  "Handle issue requests naturally, ask for details, and search for duplicates in cosmictaserdev-creator/Convx.",
+  "Allow configured admins to prepare comments on existing issues or draft new issues, with explicit confirmation and hourly write limits.",
+  "Protect in-progress GitHub writes from overlapping confirmations; no bang command is needed for the issue workflow."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
