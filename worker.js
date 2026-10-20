@@ -2904,6 +2904,23 @@ async function handleMention(env, message) {
       message.id);
     return;
   }
+  if (command === "!registerissue") {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Only the bot creator can register the /issue command.", message.id);
+      return;
+    }
+    try {
+      const mode = await createConvxIssueSlashCommand(env);
+      await sendUserReply(env, message,
+        "Registered /issue in this Discord server. Target: https://github.com/" + CONVY_ISSUES_REPOSITORY + "\n" +
+        "Before interactions can be received, set this Worker's DISCORD_PUBLIC_KEY to the key from Discord Developer Portal, then set the Interaction Endpoint URL to the Worker /interactions URL. Also add GITHUB_ISSUES_TOKEN as a Cloudflare secret with Issues: write access to the Convx repository. Token present: " + (env.GITHUB_ISSUES_TOKEN ? "yes" : "no") + ".",
+        message.id);
+    } catch (error) {
+      console.log("Issue command registration failed: " + String(error.message || error).slice(0, 160));
+      await sendUserReply(env, message, "I couldn't register /issue. Check the bot token and applications.commands access.", message.id);
+    }
+    return;
+  }
   if (command === "!provider") {
     if (!(await isAdmin(env, message))) {
       await sendUserReply(env, message, "Nope. !provider is admin-only.", message.id);
@@ -3859,8 +3876,11 @@ export class DiscordGateway extends DurableObject {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname === "/interactions" && request.method === "POST") {
+      return handleDiscordInteraction(request, env, ctx);
+    }
     if (url.pathname === "/") {
       return new Response("Convx Discord Assistant. Health endpoint: /health", {
         headers: { "content-type": "text/plain; charset=utf-8" }
@@ -3889,7 +3909,10 @@ export default {
           channelId: Boolean(env.TARGET_CHANNEL_ID),
           botUserId: Boolean(env.BOT_USER_ID),
           guildId: Boolean(env.GUILD_ID),
-          adminRoles: Boolean(env.ADMIN_ROLE_IDS)
+          adminRoles: Boolean(env.ADMIN_ROLE_IDS),
+          discordPublicKey: Boolean(env.DISCORD_PUBLIC_KEY),
+          githubIssuesToken: Boolean(env.GITHUB_ISSUES_TOKEN),
+          githubIssuesRepository: CONVY_ISSUES_REPOSITORY
         }
       });
     }
