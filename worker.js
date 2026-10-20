@@ -35,10 +35,11 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-19-r25";
+const CONVY_BUILD_VERSION = "convx-2026-10-20-r26";
 const CONVY_CURRENT_RELEASE_NOTES = [
   "Keep CONVY's established independent persona and ordinary conversation behavior.",
-  "Improve provider diagnostics and allow a recent, previously verified zero-price Pollinations catalog snapshot during brief catalog outages."
+  "Try additional OpenRouter models only after verifying the :free label and zero text-token pricing when LFM is unavailable.",
+  "Shorten user-facing provider errors and preserve detailed failure reasons in Worker logs."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -1367,6 +1368,36 @@ async function verifyOpenRouterFreeModel(env, modelId) {
   return status;
 }
 
+// Discovery only: alternate candidates must advertise :free and numeric zero prices.
+// callOpenRouterPrimary re-checks each candidate immediately before inference.
+async function discoverOpenRouterFreeFallbacks(env, primaryId, limit = 3) {
+  if (!env.OPENROUTER_API_KEY) return [];
+  const response = await fetch(OPENROUTER_API + "/models", {
+    headers: { "Authorization": "Bearer " + env.OPENROUTER_API_KEY, "Accept": "application/json" },
+    signal: AbortSignal.timeout(6500)
+  });
+  if (!response.ok) throw new Error("OpenRouter free-model discovery returned HTTP " + response.status + ".");
+  const payload = await response.json();
+  const rows = Array.isArray(payload?.data) ? payload.data : [];
+  const knownZero = value => value !== undefined && value !== null && value !== "" &&
+    Number.isFinite(Number(value)) && Number(value) === 0;
+  return rows.filter(info => {
+    const id = String(info?.id || "");
+    if (!id || id === primaryId || !id.toLowerCase().endsWith(":free")) return false;
+    const architecture = info?.architecture || {};
+    if (!Array.isArray(architecture.input_modalities) || !architecture.input_modalities.includes("text") ||
+        !Array.isArray(architecture.output_modalities) || !architecture.output_modalities.includes("text")) return false;
+    const pricing = info?.pricing;
+    if (!pricing || !knownZero(pricing.prompt) || !knownZero(pricing.completion)) return false;
+    for (const [key, value] of Object.entries(pricing)) {
+      if (!/(prompt|completion|request|price|cost|image|audio|video|cache|reasoning|web|file|input|output|token)/i.test(key)) continue;
+      if (value === undefined || value === null || value === "") continue;
+      if (!Number.isFinite(Number(value)) || Number(value) !== 0) return false;
+    }
+    return true;
+  }).slice(0, Math.max(0, Math.min(5, limit))).map(info => String(info.id));
+}
+
 function parseOpenRouterTuningArgs(raw, current, locked = {}) {
   let args;
   try { args = typeof raw === "string" ? JSON.parse(raw) : raw; }
@@ -1482,8 +1513,8 @@ async function openRouterCompletion(env, modelId, messages, settings, ownerSelec
   throw failure;
 }
 
-async function callOpenRouterPrimary(env, db, messages, maxTokens = 550) {
-  const modelId = configuredOpenRouterModel(env);
+async function callOpenRouterPrimary(env, db, messages, maxTokens = 550, modelIdOverride = "") {
+  const modelId = String(modelIdOverride || configuredOpenRouterModel(env));
   const hasImages = messages.some(message =>
     Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
   );
@@ -1612,24 +1643,45 @@ async function callFreeModel(env, db, messages, maxTokens = 550) {
     Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
   );
 
-  // Explicit !model selections retain their existing meaning and route through Pollinations.
+  // Text requests prefer LFM. If it is temporarily unavailable, try discovered
+  // OpenRouter :free alternatives; each alternate is verified before inference.
+  // Explicit !model selections and image requests keep using their existing Pollinations route.
   if (provider === "openrouter" && !selectedOverride && !hasImages) {
+    const primaryId = configuredOpenRouterModel(env);
+    let primaryError = "";
     if (!env.OPENROUTER_API_KEY) {
-      console.log("OpenRouter primary is not configured: OPENROUTER_API_KEY is missing. Trying configured Pollinations fallbacks.");
+      primaryError = "OPENROUTER_API_KEY is missing";
+      console.log("OpenRouter primary unavailable: " + primaryError);
     } else {
       try {
         return await callOpenRouterPrimary(env, db, messages, maxTokens);
       } catch (error) {
-        console.log("OpenRouter primary failed; trying configured Pollinations fallbacks: " + openRouterErrorDetail(error?.message || error));
+        primaryError = openRouterErrorDetail(error?.message || error);
+        console.log("OpenRouter primary failed; checking alternate verified-free models: " + primaryError);
+      }
+      try {
+        const candidates = await discoverOpenRouterFreeFallbacks(env, primaryId, 3);
+        for (const candidateId of candidates) {
+          try {
+            const alternate = await callOpenRouterPrimary(env, db, messages, maxTokens, candidateId);
+            return { ...alternate, fallbackFrom: "openrouter/" + primaryId };
+          } catch (error) {
+            console.log("OpenRouter free fallback failed (" + candidateId + "): " + openRouterErrorDetail(error?.message || error));
+          }
+        }
+        if (!candidates.length) console.log("OpenRouter catalog exposed no other verified-free text models.");
+      } catch (error) {
+        console.log("OpenRouter free fallback discovery failed: " + openRouterErrorDetail(error?.message || error));
       }
     }
     try {
       const fallback = await callPollinationsModel(env, db, messages, maxTokens);
-      return { ...fallback, fallbackFrom: "openrouter/" + configuredOpenRouterModel(env) };
+      return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
     } catch (error) {
-      throw new Error("OpenRouter primary was unavailable (" +
-        (env.OPENROUTER_API_KEY ? "request or free-pricing verification failed" : "OPENROUTER_API_KEY is not configured") +
-        "); the existing Pollinations fallback also failed: " + openRouterErrorDetail(error?.message || error));
+      const fallbackError = openRouterErrorDetail(error?.message || error);
+      const detail = "Primary " + primaryId + ": " + (primaryError || "unavailable") + "; Pollinations fallback: " + (fallbackError || "unavailable");
+      console.log(JSON.stringify({ event: "model_stack_failure", provider: "openrouter", model: primaryId, detail: detail.slice(0, 800) }));
+      throw new Error("No verified free text model is available right now. Please retry shortly.");
     }
   }
 
@@ -2521,8 +2573,8 @@ async function handleMention(env, message) {
       }
     } catch {}
     await sendUserReply(env, message,
-      "**Provider diagnostics**\\n" +
-      "Build: " + CONVY_BUILD_VERSION + "\\n" +
+      "**Provider diagnostics**\n" +
+      "Build: " + CONVY_BUILD_VERSION + "\n" +
       "Primary provider env: " + provider + "\\n" +
       "Configured OpenRouter model: " + modelId + "\\n" +
       "OpenRouter key present: " + (hasKey ? "yes (value hidden)" : "NO") + "\\n" +
@@ -2583,8 +2635,10 @@ async function handleMention(env, message) {
         "Preferred ranking is 1-5; green alternatives are 6-15. Use !model 1 through !model 15 · reset with !model auto.\n\n";
       await sendUserReply(env, message, prefix + lines.join("\n"), message.id);
     } catch (error) {
+      console.log("Admin model-catalog command failed: " + openRouterErrorDetail(error?.message || error));
       await sendUserReply(env, message,
-        "Couldn't fetch Pollinations' live model catalog: " + String(error.message || error).slice(0, 150), message.id);
+        "Pollinations has no verified zero-price community text models right now. LFM remains primary; use !provider and Worker logs for details.",
+        message.id);
     }
     return;
   }
@@ -2595,9 +2649,11 @@ async function handleMention(env, message) {
     const answer = await generateAnswer(env, env.DB, adultModeQuery, message.channel_id, message);
     await sendUserReply(env, message, answer, message.id);
   } catch (error) {
+    const detail = openRouterErrorDetail(error?.message || error);
+    console.log(JSON.stringify({ event: "answer_generation_failure", channel_id: String(message.channel_id || ""), detail: detail.slice(0, 800) }));
     const alert = await claimAdminAlert(env, env.DB, "answer-failure");
-    const text = (alert?.mentions ? alert.mentions + "\n" : "") + "CONVY's free-model stack failed before I could give you a reliable answer. " +
-      String(error.message || error).slice(0, 220) + "\nI will not quietly switch to a paid model. If this is urgent, ask a Convx admin now; if it keeps happening, an admin should check the Worker logs.";
+    const text = (alert?.mentions ? alert.mentions + "\n" : "") +
+      "My AI models are temporarily unavailable. Please try again shortly; details are in the Worker logs.";
     await sendUserReply(env, message, text, message.id, alert?.targets || null);
   }
   } finally {
