@@ -41,11 +41,12 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-20-r32";
+const CONVY_BUILD_VERSION = "convx-2026-10-20-r33";
 const CONVY_CURRENT_RELEASE_NOTES = [
   "Keep CONVY's independent persona, normal chat, message deduplication, and channel memory.",
   "Support natural-language issue requests and relevant bug reports without requiring a bang command.",
-  "Search related Convx issues, offer safe comment/new-issue choices, and require explicit confirmation before writing to GitHub."
+  "Search related Convx issues, offer safe comment/new-issue choices, and require explicit confirmation before writing to GitHub.",
+  "Prevent overlapping confirmations from resetting an in-progress GitHub write."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -1149,7 +1150,7 @@ async function handleNaturalIssueFlow(env, message, query) {
       explicitRequest: true
     });
     await sendUserReply(env, message,
-      "Sure. Send the issue details in one message. A useful format is **Title:** what is broken or needed, then a description of what happened, what you expected, and steps to reproduce. I'll check for duplicates and show you a draft before anything is posted. Say “cancel” to stop.",
+      "Sure. Reply to this message with the issue details. A useful format is **Title:** what is broken or needed, then a description of what happened, what you expected, and steps to reproduce. I'll check for duplicates and show you a draft before anything is posted. Say “cancel” to stop.",
       message.id);
     return true;
   }
