@@ -3,6 +3,10 @@ import { DurableObject } from "cloudflare:workers";
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
 const OPENROUTER_API = "https://openrouter.ai/api/v1";
+const CONVY_ISSUES_REPOSITORY = "cosmictaserdev-creator/Convx";
+const ISSUE_DRAFT_TTL_MS = 10 * 60 * 1000;
+const ISSUE_CREATE_RATE_LIMIT = 5;
+const ISSUE_CREATE_RATE_WINDOW_MS = 60 * 60 * 1000;
 const DEFAULT_PRIMARY_MODEL_PROVIDER = "openrouter";
 const DEFAULT_OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free";
 const OPENROUTER_MODEL_CHECK_CACHE_MS = 15 * 60 * 1000;
@@ -35,11 +39,11 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-20-r30";
+const CONVY_BUILD_VERSION = "convx-2026-10-20-r31";
 const CONVY_CURRENT_RELEASE_NOTES = [
   "Keep CONVY's established independent persona, creator commands, message deduplication, and channel memory.",
-  "Use 3.5-second fast web search with fewer results.",
-  "Schedule channel replies at least two seconds apart, with up to five concurrent generations per channel and no per-user cooldown."
+  "Use 3.5-second fast web search and non-blocking per-channel queueing.",
+  "Add an admin-only /issue modal flow that checks duplicates, previews the draft, and creates issues in cosmictaserdev-creator/Convx after confirmation."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -576,6 +580,277 @@ async function isAdmin(env, message) {
   }
   return false;
 }
+function interactionUserId(interaction) {
+  return String(interaction?.member?.user?.id || interaction?.user?.id || "");
+}
+function isInteractionAdmin(env, interaction) {
+  const userId = interactionUserId(interaction);
+  if (!userId || String(interaction?.guild_id || "") !== String(env.GUILD_ID || "")) return false;
+  if (idList(env.ADMIN_USER_IDS).includes(userId)) return true;
+  const allowedRoles = idList(env.ADMIN_ROLE_IDS);
+  if ((interaction?.member?.roles || []).some(role => allowedRoles.includes(String(role)))) return true;
+  try {
+    const permissions = BigInt(interaction?.member?.permissions || "0");
+    if ((permissions & 8n) !== 0n || (permissions & 32n) !== 0n) return true;
+  } catch {}
+  return false;
+}
+function bytesFromHex(hex) {
+  const value = String(hex || "").trim();
+  if (!/^(?:[0-9a-f]{2}){32}$/i.test(value)) throw new Error("Invalid Ed25519 public key.");
+  return new Uint8Array(value.match(/.{2}/g).map(pair => parseInt(pair, 16)));
+}
+async function verifyDiscordInteraction(request, rawBody, publicKey) {
+  try {
+    const signature = request.headers.get("x-signature-ed25519") || "";
+    const timestamp = request.headers.get("x-signature-timestamp") || "";
+    if (!/^[0-9a-f]{128}$/i.test(signature) || !/^\d{1,16}$/.test(timestamp)) return false;
+    if (Math.abs(Date.now() - Number(timestamp) * 1000) > 5 * 60 * 1000) return false;
+    const key = await crypto.subtle.importKey("raw", bytesFromHex(publicKey), { name: "Ed25519" }, false, ["verify"]);
+    return await crypto.subtle.verify(
+      { name: "Ed25519" },
+      key,
+      new Uint8Array(signature.match(/.{2}/g).map(pair => parseInt(pair, 16))),
+      new TextEncoder().encode(timestamp + rawBody)
+    );
+  } catch (error) {
+    console.log("Discord interaction signature verification failed: " + String(error.message || error).slice(0, 100));
+    return false;
+  }
+}
+function interactionReply(data) {
+  return json(data, 200);
+}
+function issueModalResponse() {
+  return interactionReply({
+    type: 9,
+    data: {
+      custom_id: "convx_issue_submit",
+      title: "Create a Convx issue",
+      components: [
+        { type: 1, components: [{ type: 4, custom_id: "issue_title", label: "Issue title", style: 1, min_length: 5, max_length: 120, required: true, placeholder: "Describe the problem or requested feature" }] },
+        { type: 1, components: [{ type: 4, custom_id: "issue_body", label: "Description and steps to reproduce", style: 2, min_length: 10, max_length: 4000, required: true, placeholder: "What happened? What did you expect? Include steps to reproduce if useful." }] }
+      ]
+    }
+  });
+}
+function issueInteractionFields(interaction) {
+  const fields = (interaction?.data?.components || []).flatMap(row => row?.components || []);
+  return {
+    title: String(fields.find(field => field.custom_id === "issue_title")?.value || "").trim(),
+    body: String(fields.find(field => field.custom_id === "issue_body")?.value || "").trim()
+  };
+}
+async function githubIssuesRequest(env, path, options = {}) {
+  if (!env.GITHUB_ISSUES_TOKEN) throw new Error("GITHUB_ISSUES_TOKEN is not configured.");
+  const response = await fetch("https://api.github.com" + path, {
+    ...options,
+    headers: {
+      "Authorization": "Bearer " + env.GITHUB_ISSUES_TOKEN,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "CONVY-Discord-Assistant",
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    },
+    signal: options.signal || AbortSignal.timeout(8000)
+  });
+  const raw = await response.text();
+  let payload = null;
+  try { payload = raw ? JSON.parse(raw) : null; } catch {}
+  if (!response.ok) {
+    console.log("GitHub issue API failure: HTTP " + response.status + " for " + String(path).split("?")[0]);
+    throw new Error("GitHub API returned HTTP " + response.status + ".");
+  }
+  return payload;
+}
+async function searchConvxIssueDuplicates(env, title) {
+  const words = [...new Set((String(title).toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) || [])
+    .filter(word => !new Set(["the", "and", "for", "with", "from", "when", "what", "this", "that", "please", "issue", "feature", "request", "bug"]).has(word)))].slice(0, 5);
+  const terms = words.length ? words.join(" ") : '"' + String(title).replace(/"/g, "").slice(0, 100) + '"';
+  const query = "repo:" + CONVY_ISSUES_REPOSITORY + " is:issue is:open in:title " + terms;
+  const payload = await githubIssuesRequest(env, "/search/issues?q=" + encodeURIComponent(query) + "&per_page=5", { method: "GET" });
+  return (Array.isArray(payload?.items) ? payload.items : []).slice(0, 3).map(item => ({
+    number: Number(item.number) || 0,
+    title: String(item.title || "Untitled issue").slice(0, 180),
+    html_url: String(item.html_url || ""),
+    state: String(item.state || "open")
+  })).filter(item => item.number > 0 && item.html_url);
+}
+async function createConvxIssueSlashCommand(env) {
+  if (!env.DISCORD_TOKEN || !env.BOT_USER_ID || !env.GUILD_ID) throw new Error("Discord bot, application, and guild configuration are required.");
+  const path = "/applications/" + env.BOT_USER_ID + "/guilds/" + env.GUILD_ID + "/commands";
+  const spec = {
+    name: "issue",
+    type: 1,
+    description: "Draft and submit an issue to the Convx project repository"
+  };
+  const current = await discord(env, path, { method: "GET" });
+  const existing = Array.isArray(current) ? current.find(command => command?.name === "issue" && Number(command.type || 1) === 1) : null;
+  if (existing?.id) {
+    await discord(env, path + "/" + existing.id, { method: "PATCH", body: JSON.stringify(spec) });
+    return "updated";
+  }
+  await discord(env, path, { method: "POST", body: JSON.stringify(spec) });
+  return "registered";
+}
+async function editDiscordInteractionResponse(interaction, data) {
+  const applicationId = String(interaction?.application_id || "");
+  const token = String(interaction?.token || "");
+  if (!/^\d{15,22}$/.test(applicationId) || !token) throw new Error("Discord interaction response token is unavailable.");
+  const response = await fetch(DISCORD_API + "/webhooks/" + applicationId + "/" + encodeURIComponent(token) + "/messages/@original", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...data, allowed_mentions: { parse: [] } }),
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!response.ok) {
+    console.log("Discord interaction response edit failed: HTTP " + response.status);
+    throw new Error("Couldn't update the interaction response.");
+  }
+}
+async function issuePreviewText(title, body, duplicates) {
+  const bodyPreview = body.length > 620 ? body.slice(0, 620) + "…" : body;
+  const duplicateLines = duplicates.length
+    ? duplicates.slice(0, 3).map(item => "• [#" + item.number + " " + item.title + "](" + item.html_url + ")").join("\n")
+    : "No likely open duplicates found.";
+  return "**Review issue before submitting**\n" +
+    "Repository: [cosmictaserdev-creator/Convx](https://github.com/" + CONVY_ISSUES_REPOSITORY + ")\n" +
+    "**Title:** " + title + "\n" +
+    "**Description:**\n" + bodyPreview + "\n" +
+    "**Possible duplicates:**\n" + duplicateLines + "\n\n" +
+    "Confirm to create the issue. The full description will be submitted.";
+}
+async function prepareConvxIssuePreview(env, interaction, title, body) {
+  const userId = interactionUserId(interaction);
+  try {
+    const duplicates = await searchConvxIssueDuplicates(env, title);
+    const draftId = crypto.randomUUID();
+    await gatewayControl(env, "/issues/draft", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        draftId, userId, title, body,
+        requesterName: String(interaction?.member?.user?.global_name || interaction?.member?.user?.username || interaction?.user?.global_name || interaction?.user?.username || "Discord user").slice(0, 100),
+        duplicates,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + ISSUE_DRAFT_TTL_MS,
+        status: "pending"
+      })
+    });
+    const content = await issuePreviewText(title, body, duplicates);
+    await editDiscordInteractionResponse(interaction, {
+      content,
+      components: [{
+        type: 1,
+        components: [
+          { type: 2, style: 3, label: "Confirm and create", custom_id: "convx_issue:confirm:" + draftId },
+          { type: 2, style: 2, label: "Cancel", custom_id: "convx_issue:cancel:" + draftId }
+        ]
+      }]
+    });
+  } catch (error) {
+    const detail = String(error.message || error);
+    const content = detail.includes("GITHUB_ISSUES_TOKEN")
+      ? "Issue creation isn't configured yet. Ask the owner to set the GITHUB_ISSUES_TOKEN Cloudflare secret."
+      : "I couldn't check for duplicate issues, so I didn't create anything. Please try again later.";
+    await editDiscordInteractionResponse(interaction, { content, components: [] }).catch(() => {});
+    console.log("Convx issue preview failed: " + detail.slice(0, 160));
+  }
+}
+async function confirmConvxIssue(env, interaction, draftId) {
+  const userId = interactionUserId(interaction);
+  try {
+    const claim = await gatewayControl(env, "/issues/draft/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draftId, userId })
+    });
+    if (!claim?.draft) throw new Error("Issue draft is no longer available.");
+    const draft = claim.draft;
+    const reporter = String(draft.requesterName || "Discord user").replace(/[\r\n]+/g, " ").slice(0, 100);
+    const issueBody = String(draft.body || "") + "\n\n---\n*Submitted via CONVY by " + reporter + " (Discord user ID: " + userId + ").*";
+    const result = await githubIssuesRequest(env, "/repos/" + CONVY_ISSUES_REPOSITORY + "/issues", {
+      method: "POST",
+      body: JSON.stringify({ title: draft.title, body: issueBody })
+    });
+    await gatewayControl(env, "/issues/draft/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draftId, userId, issueNumber: Number(result.number) || 0, issueUrl: String(result.html_url || "") })
+    }).catch(() => {});
+    await editDiscordInteractionResponse(interaction, {
+      content: "Created [#" + result.number + " " + String(result.title || draft.title).slice(0, 160) + "](" + result.html_url + ") in Convx.",
+      components: []
+    });
+  } catch (error) {
+    const detail = String(error.message || error);
+    const content = detail.includes("rate limited")
+      ? "Issue limit reached: five creations per hour. Try again later."
+      : detail.includes("GITHUB_ISSUES_TOKEN")
+        ? "Issue creation isn't configured yet. Ask the owner to set the GITHUB_ISSUES_TOKEN Cloudflare secret."
+        : detail.includes("HTTP 401") || detail.includes("HTTP 403")
+          ? "GitHub denied issue creation. Check the token's Issues: write permission and access to the Convx repository."
+          : "I couldn't create that issue. Check the repo token or try a new /issue draft.";
+    await editDiscordInteractionResponse(interaction, { content, components: [] }).catch(() => {});
+    console.log("Convx issue creation failed: " + detail.slice(0, 180));
+  }
+}
+async function cancelConvxIssue(env, interaction, draftId) {
+  const userId = interactionUserId(interaction);
+  try {
+    await gatewayControl(env, "/issues/draft/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draftId, userId })
+    });
+  } catch {}
+}
+async function handleDiscordInteraction(request, env, ctx) {
+  if (!env.DISCORD_PUBLIC_KEY) return json({ error: "Discord interactions public key is not configured." }, 503);
+  const rawBody = await request.text();
+  if (!await verifyDiscordInteraction(request, rawBody, env.DISCORD_PUBLIC_KEY)) return new Response("Invalid Discord signature", { status: 401 });
+  let interaction;
+  try { interaction = JSON.parse(rawBody); } catch { return json({ error: "Invalid JSON" }, 400); }
+  if (interaction.type === 1) return interactionReply({ type: 1 });
+  const userId = interactionUserId(interaction);
+  if (!isInteractionAdmin(env, interaction)) {
+    return interactionReply({ type: 4, data: { content: "Only configured Convx admins can create GitHub issues.", flags: 64 } });
+  }
+  if (String(interaction.guild_id || "") !== String(env.GUILD_ID || "")) {
+    return interactionReply({ type: 4, data: { content: "Use /issue in the configured Convx Discord server.", flags: 64 } });
+  }
+  if (interaction.type === 2 && interaction.data?.name === "issue") {
+    if (!env.GITHUB_ISSUES_TOKEN) {
+      return interactionReply({ type: 4, data: { content: "Issue creation isn't configured yet. Ask the owner to set the GITHUB_ISSUES_TOKEN Cloudflare secret.", flags: 64 } });
+    }
+    return issueModalResponse();
+  }
+  if (interaction.type === 5 && interaction.data?.custom_id === "convx_issue_submit") {
+    if (!env.GITHUB_ISSUES_TOKEN) {
+      return interactionReply({ type: 4, data: { content: "Issue creation isn't configured yet. Ask the owner to set the GITHUB_ISSUES_TOKEN Cloudflare secret.", flags: 64 } });
+    }
+    const { title, body } = issueInteractionFields(interaction);
+    if (title.length < 5 || title.length > 120 || body.length < 10 || body.length > 4000) {
+      return interactionReply({ type: 4, data: { content: "Add a title (5–120 characters) and description (10–4000 characters).", flags: 64 } });
+    }
+    ctx.waitUntil(prepareConvxIssuePreview(env, interaction, title, body));
+    return interactionReply({ type: 5, data: { flags: 64 } });
+  }
+  if (interaction.type === 3) {
+    const match = String(interaction.data?.custom_id || "").match(/^convx_issue:(confirm|cancel):([0-9a-f-]{36})$/i);
+    if (!match) return interactionReply({ type: 4, data: { content: "That issue action isn't recognized.", flags: 64 } });
+    const [, action, draftId] = match;
+    if (action === "cancel") {
+      ctx.waitUntil(cancelConvxIssue(env, interaction, draftId));
+      return interactionReply({ type: 7, data: { content: "Issue creation cancelled.", components: [] } });
+    }
+    ctx.waitUntil(confirmConvxIssue(env, interaction, draftId));
+    return interactionReply({ type: 5, data: { flags: 64 } });
+  }
+  return interactionReply({ type: 4, data: { content: "Unsupported CONVY interaction.", flags: 64 } });
+}
+
 function normalize(value) {
   return String(value || "").toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
