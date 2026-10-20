@@ -2902,6 +2902,7 @@ async function handleMention(env, message) {
   if (paused) return;
   const stopTyping = startTypingIndicator(env, message.channel_id);
   try {
+  if (await handleNaturalIssueFlow(env, message, query)) return;
   if (!query) {
     await sendUserReply(env, message, "hey, I'm here. what's up?", message.id);
     return;
@@ -3283,23 +3284,6 @@ async function handleMention(env, message) {
     await sendUserReply(env, message,
       "Model override set to '" + requestedId + "'. I'll prefer it for text replies. Image requests will use it only if it's one of the two vision-capable models; otherwise I'll route those to the vision models. Use !model auto to reset.",
       message.id);
-    return;
-  }
-  if (command === "!registerissue") {
-    if (!isCreator(message)) {
-      await sendUserReply(env, message, "Only the bot creator can register the /issue command.", message.id);
-      return;
-    }
-    try {
-      const mode = await createConvxIssueSlashCommand(env);
-      await sendUserReply(env, message,
-        "Registered /issue in this Discord server. Target: https://github.com/" + CONVY_ISSUES_REPOSITORY + "\n" +
-        "Before interactions can be received, set this Worker's DISCORD_PUBLIC_KEY to the key from Discord Developer Portal, then set the Interaction Endpoint URL to the Worker /interactions URL. Also add GITHUB_ISSUES_TOKEN as a Cloudflare secret with Issues: write access to the Convx repository. Token present: " + (env.GITHUB_ISSUES_TOKEN ? "yes" : "no") + ".",
-        message.id);
-    } catch (error) {
-      console.log("Issue command registration failed: " + String(error.message || error).slice(0, 160));
-      await sendUserReply(env, message, "I couldn't register /issue. Check the bot token and applications.commands access.", message.id);
-    }
     return;
   }
   if (command === "!provider") {
@@ -3927,6 +3911,123 @@ export class DiscordGateway extends DurableObject {
         return { ok: true };
       });
       return json(result, result.ok ? 200 : 409);
+    }
+    if (path === "/issues/conversation" && request.method === "GET") {
+      const url = new URL(request.url);
+      const channelId = String(url.searchParams.get("channel_id") || "");
+      const userId = String(url.searchParams.get("user_id") || "");
+      if (!/^\d{15,22}$/.test(channelId) || !/^\d{15,22}$/.test(userId)) {
+        return json({ ok: false, error: "Invalid conversation key." }, 400);
+      }
+      const key = "issue_conversation:" + channelId + ":" + userId;
+      const state = await this.ctx.storage.get(key);
+      if (!state || Number(state.expiresAt || 0) < Date.now()) {
+        if (state) await this.ctx.storage.delete(key);
+        return json({ ok: true, state: null });
+      }
+      return json({ ok: true, state });
+    }
+    if (path === "/issues/conversation" && request.method === "POST") {
+      let input = {};
+      try { input = await request.json(); } catch {}
+      const channelId = String(input.channelId || "");
+      const userId = String(input.userId || "");
+      const validStages = new Set([
+        "awaiting_details", "awaiting_choice", "awaiting_create_confirmation",
+        "awaiting_create_request", "awaiting_comment_text", "awaiting_comment_confirmation"
+      ]);
+      if (!/^\d{15,22}$/.test(channelId) || !/^\d{15,22}$/.test(userId) ||
+          !validStages.has(String(input.stage || ""))) {
+        return json({ ok: false, error: "Invalid issue conversation state." }, 400);
+      }
+      const key = "issue_conversation:" + channelId + ":" + userId;
+      const current = await this.ctx.storage.get(key);
+      if (current?.busy === "creating" || current?.busy === "commenting") {
+        return json({ ok: false, error: "A GitHub write is already in progress." }, 409);
+      }
+      const state = {
+        channelId, userId,
+        stage: String(input.stage),
+        title: String(input.title || "").trim().slice(0, 120),
+        body: String(input.body || "").trim().slice(0, 4000),
+        requesterName: String(input.requesterName || "Discord user").replace(/[\r\n]+/g, " ").slice(0, 100),
+        duplicates: Array.isArray(input.duplicates) ? input.duplicates.slice(0, 3).map(item => ({
+          number: Math.max(0, Number(item?.number) || 0),
+          title: String(item?.title || "").slice(0, 180),
+          html_url: String(item?.html_url || "").slice(0, 500)
+        })) : [],
+        explicitRequest: Boolean(input.explicitRequest),
+        commentIssueNumber: Math.max(0, Number(input.commentIssueNumber) || 0),
+        commentIssueTitle: String(input.commentIssueTitle || "").slice(0, 180),
+        commentIssueUrl: String(input.commentIssueUrl || "").slice(0, 500),
+        commentText: String(input.commentText || "").trim().slice(0, 4000),
+        busy: "",
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + ISSUE_CONVERSATION_TTL_MS
+      };
+      await this.ctx.storage.put(key, state, { expirationTtl: Math.ceil(ISSUE_CONVERSATION_TTL_MS / 1000) });
+      return json({ ok: true, stage: state.stage, expiresAt: state.expiresAt });
+    }
+    if (path === "/issues/conversation/clear" && request.method === "POST") {
+      let input = {};
+      try { input = await request.json(); } catch {}
+      const channelId = String(input.channelId || "");
+      const userId = String(input.userId || "");
+      if (!/^\d{15,22}$/.test(channelId) || !/^\d{15,22}$/.test(userId)) return json({ ok: false, error: "Invalid conversation key." }, 400);
+      const key = "issue_conversation:" + channelId + ":" + userId;
+      const state = await this.ctx.storage.get(key);
+      if (state && String(state.userId) === userId) await this.ctx.storage.delete(key);
+      return json({ ok: true });
+    }
+    if (path === "/issues/conversation/claim" && request.method === "POST") {
+      let input = {};
+      try { input = await request.json(); } catch {}
+      const channelId = String(input.channelId || "");
+      const userId = String(input.userId || "");
+      const action = String(input.action || "");
+      if (!/^\d{15,22}$/.test(channelId) || !/^\d{15,22}$/.test(userId) || !["create", "comment"].includes(action)) {
+        return json({ ok: false, error: "Invalid issue action." }, 400);
+      }
+      const key = "issue_conversation:" + channelId + ":" + userId;
+      const result = await this.ctx.storage.transaction(async txn => {
+        const state = await txn.get(key);
+        if (!state || Number(state.expiresAt || 0) < Date.now()) return { ok: false, error: "Issue draft expired." };
+        if (state.busy) return { ok: false, error: "A GitHub write is already in progress." };
+        if (action === "create" && state.stage !== "awaiting_create_confirmation") return { ok: false, error: "The draft is not ready to submit." };
+        if (action === "comment" && state.stage !== "awaiting_comment_confirmation") return { ok: false, error: "The comment is not ready to submit." };
+        const rateKey = "issue_" + action + "_rate:" + userId;
+        const now = Date.now();
+        const rateWindow = action === "comment" ? ISSUE_CREATE_RATE_WINDOW_MS : ISSUE_CREATE_RATE_WINDOW_MS;
+        const limit = action === "comment" ? ISSUE_COMMENT_RATE_LIMIT : ISSUE_CREATE_RATE_LIMIT;
+        const attempts = (await txn.get(rateKey) || []).filter(value => Number(value) > now - rateWindow);
+        if (attempts.length >= limit) return { ok: false, error: "Action rate limited; five confirmed writes per hour are allowed." };
+        attempts.push(now);
+        await txn.put(rateKey, attempts);
+        state.busy = action === "comment" ? "commenting" : "creating";
+        state.expiresAt = now + ISSUE_CONVERSATION_TTL_MS;
+        await txn.put(key, state, { expirationTtl: Math.ceil(ISSUE_CONVERSATION_TTL_MS / 1000) });
+        return { ok: true, state };
+      });
+      return json(result, result.ok ? 200 : result.error?.includes("rate limited") ? 429 : 409);
+    }
+    if (path === "/issues/conversation/reset" && request.method === "POST") {
+      let input = {};
+      try { input = await request.json(); } catch {}
+      const channelId = String(input.channelId || "");
+      const userId = String(input.userId || "");
+      const action = String(input.action || "");
+      const key = "issue_conversation:" + channelId + ":" + userId;
+      const result = await this.ctx.storage.transaction(async txn => {
+        const state = await txn.get(key);
+        if (!state || String(state.userId) !== userId) return { ok: false };
+        state.busy = "";
+        state.stage = action === "comment" ? "awaiting_comment_confirmation" : "awaiting_create_confirmation";
+        state.updatedAt = Date.now();
+        state.expiresAt = Date.now() + ISSUE_CONVERSATION_TTL_MS;
+        await txn.put(key, state, { expirationTtl: Math.ceil(ISSUE_CONVERSATION_TTL_MS / 1000) });
+        return { ok: true };
+      });
+      return json(result, result.ok ? 200 : 404);
     }
     return json({ error: "Not found" }, 404);
   }
