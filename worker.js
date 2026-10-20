@@ -6,7 +6,7 @@ const OPENROUTER_API = "https://openrouter.ai/api/v1";
 const DEFAULT_PRIMARY_MODEL_PROVIDER = "openrouter";
 const DEFAULT_OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free";
 const OPENROUTER_MODEL_CHECK_CACHE_MS = 15 * 60 * 1000;
-const OPENROUTER_REQUEST_TIMEOUT_MS = 12000;
+const OPENROUTER_REQUEST_TIMEOUT_MS = 30000;
 // Lazy-refresh the shared Pollinations catalog hourly in Durable Object storage, never D1.
 const MODEL_CACHE_MS = 60 * 60 * 1000;
 // A previously verified zero-price catalog can be used briefly during a catalog outage.
@@ -35,11 +35,11 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-20-r28";
+const CONVY_BUILD_VERSION = "convx-2026-10-20-r29";
 const CONVY_CURRENT_RELEASE_NOTES = [
   "Keep CONVY's established independent persona and ordinary conversation behavior.",
-  "Handle OpenRouter JSON and server-sent-event completion responses, and discover verified-free OpenRouter alternatives if LFM fails.",
-  "Shorten user-facing provider errors and preserve structured failure diagnostics without logging response text."
+  "Increase the OpenRouter response timeout to reduce false failures on slow completions.",
+  "Handle JSON and server-sent-event completions, try only verified-free OpenRouter alternatives, and keep Discord error replies short."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -1567,6 +1567,11 @@ async function openRouterCompletion(env, modelId, messages, settings, ownerSelec
       }
     } catch (error) {
       if (error?.status) throw error;
+      if (error?.name === "AbortError" || error?.name === "TimeoutError") {
+        const failure = new Error("OpenRouter completion response timed out while reading the body.");
+        failure.status = 504;
+        throw failure;
+      }
       const failure = new Error("OpenRouter response body could not be read.");
       failure.status = 502;
       throw failure;
