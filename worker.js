@@ -7,6 +7,8 @@ const CONVY_ISSUES_REPOSITORY = "cosmictaserdev-creator/Convx";
 const ISSUE_DRAFT_TTL_MS = 10 * 60 * 1000;
 const ISSUE_CREATE_RATE_LIMIT = 5;
 const ISSUE_CREATE_RATE_WINDOW_MS = 60 * 60 * 1000;
+const ISSUE_CONVERSATION_TTL_MS = 30 * 60 * 1000;
+const ISSUE_COMMENT_RATE_LIMIT = 5;
 const DEFAULT_PRIMARY_MODEL_PROVIDER = "openrouter";
 const DEFAULT_OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free";
 const OPENROUTER_MODEL_CHECK_CACHE_MS = 15 * 60 * 1000;
@@ -39,11 +41,11 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-20-r31";
+const CONVY_BUILD_VERSION = "convx-2026-10-20-r32";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Keep CONVY's established independent persona, creator commands, message deduplication, and channel memory.",
-  "Use 3.5-second fast web search and non-blocking per-channel queueing.",
-  "Add an admin-only /issue modal flow that checks duplicates, previews the draft, and creates issues in cosmictaserdev-creator/Convx after confirmation."
+  "Keep CONVY's independent persona, normal chat, message deduplication, and channel memory.",
+  "Support natural-language issue requests and relevant bug reports without requiring a bang command.",
+  "Search related Convx issues, offer safe comment/new-issue choices, and require explicit confirmation before writing to GitHub."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -806,6 +808,385 @@ async function cancelConvxIssue(env, interaction, draftId) {
     });
   } catch {}
 }
+function issueCreateIntent(query) {
+  return /\b(?:create|file|open|submit|raise|log|report|make|draft)\b.{0,35}\b(?:github\s+)?(?:an?\s+)?(?:new\s+)?(?:bug\s+)?issue\b/i.test(String(query || "")) ||
+    /\b(?:issue|bug report)\b.{0,30}\b(?:create|file|open|submit|raise|log)\b/i.test(String(query || "")) ||
+    /\b(?:can|could|would) you\b.{0,45}\b(?:create|file|open|submit|raise)\b.{0,25}\bissue\b/i.test(String(query || ""));
+}
+function issueReportSuggestion(query) {
+  const text = String(query || "").trim();
+  if (text.length < 35 || text.length > 4000) return false;
+  const problem = /\b(?:bug|crash(?:es|ed|ing)?|broken|doesn['’]?t work|does not work|not working|fails?|failure|freez(?:e|es|ing)|error|missing feature|feature request|please add|should add|would be nice if|suggestion|regression|cannot play|can['’]?t play|won['’]?t play)\b/i.test(text);
+  const product = /\b(?:convx|music player|playback|lyrics|playlist|album art|equalizer|offline playback|download(?:s|ing)?|music library|audio player|player app|track queue|android auto)\b/i.test(text);
+  return problem && product;
+}
+function issueCancelIntent(query) {
+  return /^(?:cancel|never ?mind|nevermind|stop this|forget it|discard(?: this)?|cancel the issue)$/i.test(String(query || "").trim());
+}
+function issueConfirmIntent(query) {
+  return /^(?:confirm(?: issue)?|confirm create|yes(?: please)?|yes create it|create it|submit(?: it)?|go ahead|do it|file it|post it|proceed|yes submit|yes file it)$/i.test(String(query || "").trim());
+}
+function issueCreateNewIntent(query) {
+  return /\b(?:create|file|open|submit|make)\b.{0,30}\b(?:a\s+)?(?:new\s+)?issue\b/i.test(String(query || "")) ||
+    /\bnew issue\b/i.test(String(query || ""));
+}
+function issueTitleFromBody(body) {
+  const text = String(body || "").trim();
+  const explicit = text.match(/^title\s*:\s*(.+)$/im);
+  if (explicit) return explicit[1].trim().replace(/^["']|["']$/g, "").slice(0, 120);
+  const firstLine = text.split(/\r?\n/)[0].trim();
+  const raw = firstLine.length > 130 ? firstLine.slice(0, 127) + "..." : firstLine;
+  const clean = raw.replace(/^description\s*:\s*/i, "").replace(/^[-*#\s]+/, "").trim();
+  return (clean || text.slice(0, 120)).slice(0, 120);
+}
+function issueBodyFromDetails(text) {
+  const input = String(text || "").trim().slice(0, 4000);
+  const m = input.match(/^title\s*:\s*[^\r\n]+\s*[\r\n]+(?:description\s*:\s*)?([\s\S]+)$/i);
+  if (m) return m[1].trim().slice(0, 4000);
+  return input.replace(/^description\s*:\s*/i, "").slice(0, 4000);
+}
+function parseIssueCommentRequest(query, state) {
+  const text = String(query || "").trim();
+  let m = text.match(/^(?:please\s+)?(?:add|post|write)\s+(?:this\s+)?(?:as\s+)?(?:a\s+)?comment\s+(?:on|to)\s+#?(\d+)(?:\s*(?::|—|-)\s*|\s+with\s+|\s+)([\s\S]+)$/i);
+  if (!m) m = text.match(/^(?:please\s+)?comment\s+(?:on|to)\s+#?(\d+)(?:\s*(?::|—|-)\s*|\s+with\s+|\s+)([\s\S]+)$/i);
+  if (m) return { issueNumber: Number(m[1]), comment: String(m[2] || "").trim() };
+  m = text.match(/^(?:please\s+)?(?:add|post|write)\s+(?:a\s+)?comment\s+(?:on|to)\s+#?(\d+)\s*$/i) ||
+      text.match(/^(?:please\s+)?comment\s+(?:on|to)\s+#?(\d+)\s*$/i);
+  if (m) return { issueNumber: Number(m[1]), comment: "" };
+  const first = Array.isArray(state?.duplicates) ? state.duplicates[0] : null;
+  m = text.match(/^(?:comment on|add a comment to)\s+(?:the\s+)?(?:first|top|most relevant)\s+(?:one|issue)(?:\s*:\s*|\s+with\s+)([\s\S]+)$/i);
+  if (m && first?.number) return { issueNumber: Number(first.number), comment: String(m[1] || "").trim() };
+  return null;
+}
+function renderIssueCandidates(duplicates) {
+  if (!duplicates?.length) return "I couldn't find any likely matching open issues.";
+  return duplicates.slice(0, 3).map(item =>
+    "• [#" + item.number + " " + String(item.title || "Untitled issue").slice(0, 160) + "](" + item.html_url + ")"
+  ).join("\n");
+}
+async function getIssueConversation(env, channelId, userId) {
+  return gatewayControl(env, "/issues/conversation?channel_id=" + encodeURIComponent(String(channelId)) + "&user_id=" + encodeURIComponent(String(userId)));
+}
+async function saveIssueConversation(env, channelId, userId, state) {
+  return gatewayControl(env, "/issues/conversation", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      channelId: String(channelId), userId: String(userId),
+      ...state,
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + ISSUE_CONVERSATION_TTL_MS
+    })
+  });
+}
+async function clearIssueConversation(env, channelId, userId) {
+  return gatewayControl(env, "/issues/conversation/clear", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ channelId: String(channelId), userId: String(userId) })
+  });
+}
+function issueReporterName(message) {
+  return String(message?.member?.nick || message?.author?.global_name || message?.author?.username || "Discord user").replace(/[\r\n]+/g, " ").slice(0, 100);
+}
+async function sendIssueReview(env, message, state, suggestionOnly = false) {
+  const bodyPreview = String(state.body || "").length > 700 ? String(state.body).slice(0, 700) + "…" : String(state.body || "");
+  let response;
+  if (state.duplicates?.length) {
+    response = (suggestionOnly ? "This sounds like a Convx issue. I found a few related open issues:\n" : "Before creating a new issue, I found these possibly related open issues:\n") +
+      renderIssueCandidates(state.duplicates) +
+      "\n\nYou can say **“comment on #123: your comment”** to prepare a comment, or **“create a new issue”** to continue. I'll ask before posting anything.";
+    state.stage = "awaiting_choice";
+  } else if (suggestionOnly) {
+    state.stage = "awaiting_create_request";
+    response = "This sounds worth reporting to Convx. I couldn't find a likely matching open issue. Say **“create an issue”** and I'll prepare a draft for you to review. Nothing has been posted.";
+  } else {
+    state.stage = "awaiting_create_confirmation";
+    response = "**Issue draft for Convx**\n**Title:** " + state.title + "\n**Description:**\n" + bodyPreview +
+      "\n\nI couldn't find a likely duplicate. Reply **“confirm create”** to submit it, or **“cancel”** to discard it.";
+  }
+  await saveIssueConversation(env, message.channel_id, message.author.id, state);
+  await sendUserReply(env, message, response, message.id);
+}
+async function beginIssueReviewFromDetails(env, message, title, body, explicitRequest, isAdminUser) {
+  if (!env.GITHUB_ISSUES_TOKEN) {
+    await sendUserReply(env, message, "GitHub issue creation isn't configured yet. The owner needs to add the repository token as a Worker secret.", message.id);
+    return;
+  }
+  if (!isAdminUser) {
+    await sendUserReply(env, message, "I can suggest related Convx issues, but only configured admins can create issues or post comments.", message.id);
+    return;
+  }
+  try {
+    const duplicates = await searchConvxIssueDuplicates(env, title);
+    const state = {
+      title: String(title).trim().slice(0, 120),
+      body: String(body).trim().slice(0, 4000),
+      requesterName: issueReporterName(message),
+      duplicates,
+      explicitRequest: Boolean(explicitRequest),
+      stage: "awaiting_choice"
+    };
+    if (!duplicates.length && !explicitRequest) {
+      state.stage = "awaiting_create_request";
+      await sendIssueReview(env, message, state, true);
+    } else {
+      await sendIssueReview(env, message, state, false);
+    }
+  } catch (error) {
+    console.log("Natural issue duplicate search failed: " + openRouterErrorDetail(error?.message || error));
+    await sendUserReply(env, message, "I couldn't check existing Convx issues, so I didn't prepare anything. Try again shortly.", message.id);
+  }
+}
+async function verifyConvxIssue(env, issueNumber) {
+  const number = Number(issueNumber);
+  if (!Number.isSafeInteger(number) || number < 1) throw new Error("Invalid Convx issue number.");
+  const issue = await githubIssuesRequest(env, "/repos/" + CONVY_ISSUES_REPOSITORY + "/issues/" + number, { method: "GET" });
+  if (!issue || issue.pull_request || !issue.html_url) throw new Error("That number is not a Convx issue.");
+  return {
+    number,
+    title: String(issue.title || "Convx issue").slice(0, 180),
+    html_url: String(issue.html_url),
+    state: String(issue.state || "open")
+  };
+}
+async function issueConversationClaim(env, channelId, userId, action) {
+  return gatewayControl(env, "/issues/conversation/claim", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ channelId: String(channelId), userId: String(userId), action })
+  });
+}
+async function createIssueFromConversation(env, message) {
+  const channelId = String(message.channel_id), userId = String(message.author.id);
+  let claim;
+  try {
+    claim = await issueConversationClaim(env, channelId, userId, "create");
+    const state = claim?.state;
+    if (!state) throw new Error("This issue draft expired.");
+    const issueBody = String(state.body || "") + "\n\n---\n*Submitted via CONVY by " +
+      String(state.requesterName || issueReporterName(message)).replace(/[\r\n]+/g, " ").slice(0, 100) +
+      " (Discord user ID: " + userId + ").*";
+    const result = await githubIssuesRequest(env, "/repos/" + CONVY_ISSUES_REPOSITORY + "/issues", {
+      method: "POST",
+      body: JSON.stringify({ title: state.title, body: issueBody })
+    });
+    await clearIssueConversation(env, channelId, userId);
+    await sendUserReply(env, message, "Created [#" + result.number + " " + String(result.title || state.title).slice(0, 160) + "](" + result.html_url + ") in Convx.", message.id);
+  } catch (error) {
+    await gatewayControl(env, "/issues/conversation/reset", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channelId, userId, action: "create" })
+    }).catch(() => {});
+    const detail = String(error.message || error);
+    const text = detail.includes("rate limited")
+      ? "You've reached the issue creation limit for this hour. Try again later."
+      : detail.includes("HTTP 401") || detail.includes("HTTP 403")
+        ? "GitHub denied issue creation. Check the token's Issues: write access to Convx."
+        : "I couldn't create that issue. Your draft is still available; try confirming again in a moment.";
+    console.log("Natural Convx issue creation failed: " + detail.slice(0, 180));
+    await sendUserReply(env, message, text, message.id);
+  }
+}
+async function addCommentFromConversation(env, message, state) {
+  const channelId = String(message.channel_id), userId = String(message.author.id);
+  try {
+    const claim = await issueConversationClaim(env, channelId, userId, "comment");
+    if (!claim?.state) throw new Error("The comment draft expired.");
+    const draft = claim.state;
+    const issue = await verifyConvxIssue(env, draft.commentIssueNumber);
+    const result = await githubIssuesRequest(env,
+      "/repos/" + CONVY_ISSUES_REPOSITORY + "/issues/" + issue.number + "/comments", {
+        method: "POST",
+        body: JSON.stringify({ body: String(draft.commentText || "").slice(0, 4000) +
+          "\n\n*Comment added via CONVY by " + String(draft.requesterName || issueReporterName(message)).slice(0, 100) +
+          " (Discord user ID: " + userId + ").*" })
+      });
+    await clearIssueConversation(env, channelId, userId);
+    await sendUserReply(env, message, "Added your comment to [#" + issue.number + " " + issue.title + "](" + issue.html_url + "). [View comment](" + result.html_url + ")", message.id);
+  } catch (error) {
+    await gatewayControl(env, "/issues/conversation/reset", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channelId, userId, action: "comment" })
+    }).catch(() => {});
+    const detail = String(error.message || error);
+    const text = detail.includes("rate limited")
+      ? "You've reached the comment limit for this hour. Try again later."
+      : detail.includes("HTTP 401") || detail.includes("HTTP 403")
+        ? "GitHub denied the comment. Check the token's Issues: write access to Convx."
+        : "I couldn't add the comment. Your draft is still available; try confirming again.";
+    console.log("Natural Convx issue comment failed: " + detail.slice(0, 180));
+    await sendUserReply(env, message, text, message.id);
+  }
+}
+async function handleNaturalIssueFlow(env, message, query) {
+  const channelId = String(message.channel_id || ""), userId = String(message.author?.id || "");
+  const explicitRequest = issueCreateIntent(query);
+  const suggestion = issueReportSuggestion(query);
+  let state = null;
+  try {
+    const result = await getIssueConversation(env, channelId, userId);
+    state = result?.state || null;
+  } catch (error) {
+    console.log("Issue conversation lookup skipped: " + openRouterErrorDetail(error?.message || error));
+  }
+  if (!state && !explicitRequest && !suggestion) return false;
+
+  const privileged = await isAdmin(env, message);
+  if (state) {
+    if (!privileged) {
+      await sendUserReply(env, message, "Only configured Convx admins can submit issues or post comments.", message.id);
+      return true;
+    }
+    if (issueCancelIntent(query)) {
+      await clearIssueConversation(env, channelId, userId).catch(() => {});
+      await sendUserReply(env, message, "Cancelled. Nothing was posted to GitHub.", message.id);
+      return true;
+    }
+    const normalized = String(query || "").trim().toLowerCase();
+    if (state.stage === "awaiting_details") {
+      if (String(query || "").trim().length < 12) {
+        await sendUserReply(env, message, "Send a little more detail, including what happened and what you expected. You can say “cancel” any time.", message.id);
+        return true;
+      }
+      const title = issueTitleFromBody(query);
+      const body = issueBodyFromDetails(query);
+      if (title.length < 5 || body.length < 10) {
+        await sendUserReply(env, message, "Please include a clearer title and description so I can prepare a useful issue.", message.id);
+        return true;
+      }
+      await beginIssueReviewFromDetails(env, message, title, body, true, true);
+      return true;
+    }
+    if (state.stage === "awaiting_create_request") {
+      if (issueCreateNewIntent(query)) {
+        state.stage = "awaiting_create_confirmation";
+        await saveIssueConversation(env, channelId, userId, state);
+        await sendUserReply(env, message, "**Issue draft**\n**Title:** " + state.title +
+          "\n**Description:**\n" + String(state.body || "").slice(0, 600) +
+          "\n\nReply **“confirm create”** to submit, or **“cancel”** to discard.", message.id);
+        return true;
+      }
+      return false;
+    }
+    if (state.stage === "awaiting_choice") {
+      const commentRequest = parseIssueCommentRequest(query, state);
+      if (commentRequest) {
+        let issue;
+        try { issue = await verifyConvxIssue(env, commentRequest.issueNumber); }
+        catch (error) {
+          await sendUserReply(env, message, "I couldn't verify that number as an issue in the Convx repository. Check the issue link and try again.", message.id);
+          return true;
+        }
+        if (!commentRequest.comment) {
+          state.stage = "awaiting_comment_text";
+          state.commentIssueNumber = issue.number;
+          state.commentIssueTitle = issue.title;
+          state.commentIssueUrl = issue.html_url;
+          await saveIssueConversation(env, channelId, userId, state);
+          await sendUserReply(env, message, "What should I comment on [#" + issue.number + " " + issue.title + "](" + issue.html_url + ")? I'll show it to you for confirmation before posting.", message.id);
+        } else {
+          state.stage = "awaiting_comment_confirmation";
+          state.commentIssueNumber = issue.number;
+          state.commentIssueTitle = issue.title;
+          state.commentIssueUrl = issue.html_url;
+          state.commentText = commentRequest.comment.slice(0, 4000);
+          await saveIssueConversation(env, channelId, userId, state);
+          await sendUserReply(env, message, "**Review comment for [#" + issue.number + " " + issue.title + "](" + issue.html_url + ")**\n" +
+            String(state.commentText).slice(0, 700) + "\n\nReply **“confirm comment”** to post it, or **“cancel”** to discard it.", message.id);
+        }
+        return true;
+      }
+      if (issueCreateNewIntent(query)) {
+        state.stage = "awaiting_create_confirmation";
+        await saveIssueConversation(env, channelId, userId, state);
+        await sendUserReply(env, message, "**Issue draft**\n**Title:** " + state.title +
+          "\n**Description:**\n" + String(state.body || "").slice(0, 600) +
+          "\n\nReply **“confirm create”** to submit, or **“cancel”** to discard.", message.id);
+        return true;
+      }
+      return false;
+    }
+    if (state.stage === "awaiting_comment_text") {
+      if (String(query || "").trim().length < 3) {
+        await sendUserReply(env, message, "Write the comment you'd like me to post, or say “cancel”.", message.id);
+        return true;
+      }
+      state.commentText = String(query).trim().slice(0, 4000);
+      state.stage = "awaiting_comment_confirmation";
+      await saveIssueConversation(env, channelId, userId, state);
+      await sendUserReply(env, message, "**Review comment for [#" + state.commentIssueNumber + " " + state.commentIssueTitle + "](" + state.commentIssueUrl + ")**\n" +
+        state.commentText.slice(0, 700) + "\n\nReply **“confirm comment”** to post it, or **“cancel”** to discard.", message.id);
+      return true;
+    }
+    if (state.stage === "awaiting_create_confirmation" && issueConfirmIntent(query)) {
+      await createIssueFromConversation(env, message);
+      return true;
+    }
+    if (state.stage === "awaiting_comment_confirmation" &&
+        /^(?:confirm comment|confirm|yes(?: please)?|post it|add it|go ahead|do it)$/i.test(normalized)) {
+      await addCommentFromConversation(env, message, state);
+      return true;
+    }
+    return false;
+  }
+
+  if (explicitRequest) {
+    if (!privileged) {
+      await sendUserReply(env, message, "I can help identify similar Convx issues, but only configured admins can submit an issue or comment.", message.id);
+      return true;
+    }
+    if (!env.GITHUB_ISSUES_TOKEN) {
+      await sendUserReply(env, message, "GitHub issue creation isn't configured yet. The owner needs to add the repository token as a Worker secret.", message.id);
+      return true;
+    }
+    await saveIssueConversation(env, channelId, userId, {
+      stage: "awaiting_details",
+      title: "",
+      body: "",
+      requesterName: issueReporterName(message),
+      duplicates: [],
+      explicitRequest: true
+    });
+    await sendUserReply(env, message,
+      "Sure. Send the issue details in one message. A useful format is **Title:** what is broken or needed, then a description of what happened, what you expected, and steps to reproduce. I'll check for duplicates and show you a draft before anything is posted. Say “cancel” to stop.",
+      message.id);
+    return true;
+  }
+
+  if (suggestion) {
+    if (!env.GITHUB_ISSUES_TOKEN) {
+      await sendUserReply(env, message, "That sounds worth reporting to Convx. You can check [existing issues](https://github.com/" + CONVY_ISSUES_REPOSITORY + "/issues) and ask a configured admin to file it.", message.id);
+      return true;
+    }
+    try {
+      const title = issueTitleFromBody(query);
+      const body = issueBodyFromDetails(query);
+      const duplicates = await searchConvxIssueDuplicates(env, title);
+      if (!privileged) {
+        await sendUserReply(env, message,
+          "That sounds worth reporting. Possible related open issues:\n" + renderIssueCandidates(duplicates) +
+          "\n\nA configured Convx admin can comment on an existing issue or file a new one.",
+          message.id);
+        return true;
+      }
+      const state = {
+        stage: duplicates.length ? "awaiting_choice" : "awaiting_create_request",
+        title, body, requesterName: issueReporterName(message),
+        duplicates, explicitRequest: false
+      };
+      await saveIssueConversation(env, channelId, userId, state);
+      await sendIssueReview(env, message, state, true);
+      return true;
+    } catch (error) {
+      console.log("Convx issue suggestion lookup failed: " + openRouterErrorDetail(error?.message || error));
+      await sendUserReply(env, message, "That may be worth reporting, but I couldn't check existing issues right now.", message.id);
+      return true;
+    }
+  }
+  return false;
+}
+
 async function handleDiscordInteraction(request, env, ctx) {
   if (!env.DISCORD_PUBLIC_KEY) return json({ error: "Discord interactions public key is not configured." }, 503);
   const rawBody = await request.text();
