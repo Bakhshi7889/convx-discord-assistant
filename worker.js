@@ -48,7 +48,7 @@ const CONVY_CURRENT_RELEASE_NOTES = [
   "Follow Polli's duplicate-first issue workflow: suggest comments on existing issues before creating new ones.",
   "Let server members propose and confirm comments on existing Convx issues with stable per-author attribution, duplicate-comment checks, and per-user/repository rate limits.",
   "Restrict new issue creation to configured admins and require an explicit duplicate override plus final confirmation when similar issues already exist."
-]];
+ ];
 const CONVY_RELEASE_HISTORY = [
   {
     version: "convx-2026-10-18-r21",
