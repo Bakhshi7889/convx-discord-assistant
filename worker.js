@@ -49,7 +49,6 @@ const CONVY_CURRENT_RELEASE_NOTES = [
   "Allow any server member to propose confirmed comments on an existing issue, with per-user and repository-wide rate limits plus duplicate-comment detection.",
   "Restrict new issues to configured admins, recheck duplicates immediately before submission, and block duplicates in the legacy modal flow."
 ];
-const CONVY_RELEASE_HISTORY];
 const CONVY_RELEASE_HISTORY = [
   {
     version: "convx-2026-10-18-r21",
