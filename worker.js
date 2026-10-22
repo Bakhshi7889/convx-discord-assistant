@@ -43,12 +43,13 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-22-r35";
+const CONVY_BUILD_VERSION = "convx-2026-10-22-r36";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Follow Polli's duplicate-first issue workflow: suggest comments on existing issues before creating new ones.",
-  "Let server members propose and confirm comments on existing Convx issues with stable per-author attribution, duplicate-comment checks, and per-user/repository rate limits.",
-  "Restrict new issue creation to configured admins and require an explicit duplicate override plus final confirmation when similar issues already exist."
- ];
+  "Search for similar open issues before creation and prefer confirmed comments with new information over duplicate tickets.",
+  "Allow any server member to propose confirmed comments on an existing issue, with per-user and repository-wide rate limits plus duplicate-comment detection.",
+  "Restrict new issues to configured admins, recheck duplicates immediately before submission, and block duplicates in the legacy modal flow."
+];
+const CONVY_RELEASE_HISTORY];
 const CONVY_RELEASE_HISTORY = [
   {
     version: "convx-2026-10-18-r21",
@@ -729,6 +730,13 @@ async function prepareConvxIssuePreview(env, interaction, title, body) {
   const userId = interactionUserId(interaction);
   try {
     const duplicates = await searchConvxIssueDuplicates(env, title);
+    if (duplicates.length) {
+      const content = "I found existing open issues that may already cover this, so I did not prepare a new ticket:\n" +
+        renderIssueCandidates(duplicates) +
+        "\n\nTo avoid repo spam, use CONVY's normal chat flow to say **“add this info to #123”** or **“comment on #123: new details”**. If these are genuinely different problems, a configured admin can ask CONVY to create a separate issue after reviewing the matches.";
+      await editDiscordInteractionResponse(interaction, { content, components: [] });
+      return;
+    }
     const draftId = crypto.randomUUID();
     await gatewayControl(env, "/issues/draft", {
       method: "POST",
@@ -736,15 +744,14 @@ async function prepareConvxIssuePreview(env, interaction, title, body) {
       body: JSON.stringify({
         draftId, userId, title, body,
         requesterName: String(interaction?.member?.user?.global_name || interaction?.member?.user?.username || interaction?.user?.global_name || interaction?.user?.username || "Discord user").slice(0, 100),
-        duplicates,
+        duplicates: [],
         createdAt: Date.now(),
         expiresAt: Date.now() + ISSUE_DRAFT_TTL_MS,
         status: "pending"
       })
     });
-    const content = await issuePreviewText(title, body, duplicates);
     await editDiscordInteractionResponse(interaction, {
-      content,
+      content: await issuePreviewText(title, body, []),
       components: [{
         type: 1,
         components: [
@@ -765,6 +772,24 @@ async function prepareConvxIssuePreview(env, interaction, title, body) {
 async function confirmConvxIssue(env, interaction, draftId) {
   const userId = interactionUserId(interaction);
   try {
+    const draftLookup = await gatewayControl(env,
+      "/issues/draft?draft_id=" + encodeURIComponent(draftId) + "&user_id=" + encodeURIComponent(userId));
+    if (!draftLookup?.draft) throw new Error("Issue draft is no longer available.");
+    const freshDuplicates = await searchConvxIssueDuplicates(env, draftLookup.draft.title);
+    if (freshDuplicates.length) {
+      await gatewayControl(env, "/issues/draft/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ draftId, userId })
+      }).catch(() => {});
+      await editDiscordInteractionResponse(interaction, {
+        content: "A matching open issue appeared before submission, so I stopped this new ticket:\n" +
+          renderIssueCandidates(freshDuplicates) +
+          "\n\nUse CONVY's normal chat flow to add your new information to an existing issue instead.",
+        components: []
+      });
+      return;
+    }
     const claim = await gatewayControl(env, "/issues/draft/claim", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -790,12 +815,12 @@ async function confirmConvxIssue(env, interaction, draftId) {
   } catch (error) {
     const detail = String(error.message || error);
     const content = detail.includes("rate limited")
-      ? "Issue limit reached: five creations per hour. Try again later."
+      ? "The new-issue limit has been reached for you or the repository. Try again later."
       : detail.includes("GITHUB_ISSUES_TOKEN")
         ? "Issue creation isn't configured yet. Ask the owner to set the GITHUB_ISSUES_TOKEN Cloudflare secret."
         : detail.includes("HTTP 401") || detail.includes("HTTP 403")
           ? "GitHub denied issue creation. Check the token's Issues: write permission and access to the Convx repository."
-          : "I couldn't create that issue. Check the repo token or try a new /issue draft.";
+          : "I couldn't create that issue. Check the repo token or try a new issue draft.";
     await editDiscordInteractionResponse(interaction, { content, components: [] }).catch(() => {});
     console.log("Convx issue creation failed: " + detail.slice(0, 180));
   }
@@ -4031,19 +4056,27 @@ export class DiscordGateway extends DurableObject {
         if (!draft || Number(draft.expiresAt) < Date.now()) return { ok: false, error: "Issue draft expired." };
         if (String(draft.userId) !== userId) return { ok: false, error: "This draft belongs to another requester." };
         if (draft.status !== "pending") return { ok: false, error: "Issue draft was already confirmed or cancelled." };
-        const rateKey = "issue_create_rate:" + userId;
-        const timestamps = (await txn.get(rateKey) || []).filter(value => Number(value) > Date.now() - ISSUE_CREATE_RATE_WINDOW_MS);
-        if (timestamps.length >= ISSUE_CREATE_RATE_LIMIT) return { ok: false, error: "Issue creation rate limited to five per hour." };
-        timestamps.push(Date.now());
-        await txn.put(rateKey, timestamps);
+        const now = Date.now();
+        const policies = [
+          { key: "issue_create_rate:" + userId, limit: ISSUE_CREATE_RATE_LIMIT },
+          { key: "issue_create_rate:repository", limit: ISSUE_CREATE_GLOBAL_LIMIT }
+        ];
+        const writes = [];
+        for (const policy of policies) {
+          const timestamps = (await txn.get(policy.key) || []).filter(value => Number(value) > now - ISSUE_CREATE_RATE_WINDOW_MS);
+          if (timestamps.length >= policy.limit) return { ok: false, error: "Issue creation rate limited for this requester or repository." };
+          timestamps.push(now);
+          writes.push({ key: policy.key, timestamps });
+        }
+        for (const item of writes) await txn.put(item.key, item.timestamps);
         draft.status = "creating";
-        draft.claimedAt = Date.now();
+        draft.claimedAt = now;
         await txn.put(key, draft);
         return { ok: true, draft };
       });
       return json(result, result.ok ? 200 : result.error.includes("rate limited") ? 429 : result.error.includes("another requester") ? 403 : 409);
     }
-    if (path === "/issues/draft/complete" && request.method === "POST") {
+if (path === "/issues/draft/complete" && request.method === "POST") {
       let input = {};
       try { input = await request.json(); } catch {}
       const draftId = String(input.draftId || "");
