@@ -21,7 +21,7 @@ const MODEL_CACHE_MS = 60 * 60 * 1000;
 const MODEL_STALE_FALLBACK_MAX_MS = 24 * 60 * 60 * 1000;
 const MODEL_CATALOG_SCHEMA_VERSION = 6;
 const MODEL_ATTEMPT_LIMIT = 3;
-const MODEL_TIMEOUT_MS = 9000;
+const MODEL_TIMEOUT_MS = 12000;
 // Explicit first-choice order. Models still must appear in the live catalog as eligible,
 // free community text models before they can be called.
 const PREFERRED_MODEL_ORDER = [
@@ -43,12 +43,12 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-22-r36";
+const CONVY_BUILD_VERSION = "convx-2026-10-24-r37";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Search for similar open issues before creation and prefer confirmed comments with new information over duplicate tickets.",
-  "Allow any server member to propose confirmed comments on an existing issue, with per-user and repository-wide rate limits plus duplicate-comment detection.",
-  "Restrict new issues to configured admins, recheck duplicates immediately before submission, and block duplicates in the legacy modal flow."
-];
+  "Improve resilience to intermittent free-model rate limits by honoring Retry-After and failing over to other verified-free models instead of retrying too early.",
+  "Limit concurrent model requests globally across channels, not just within each channel, to reduce bursts against free providers.",
+  "Detect structured provider errors in HTTP 200 Pollinations responses and log the real failure reason without exposing it in public chat."
+]];
 const CONVY_RELEASE_HISTORY = [
   {
     version: "convx-2026-10-18-r21",
@@ -2022,6 +2022,15 @@ async function callPollinationsModel(env,db,messages,maxTokens=550) {
       }
 
       let data = await response.json();
+      if (data?.error) {
+        const errorCode = Number(data.error.code || data.error.status) || 0;
+        const detail = String(data.error.message || data.error.code || "unspecified provider error").slice(0, 110);
+        await recordModelResult(env, id, Date.now() - started, false);
+        recorded = true;
+        lastFailure = id + " returned provider error" + (errorCode ? " " + errorCode : "") + ": " + detail;
+        console.log(JSON.stringify({ event: "pollinations_provider_error", model: id, http_status: errorCode || 200, error: detail }));
+        continue;
+      }
       let assistantMessage = data.choices?.[0]?.message;
       const toolCalls = Array.isArray(assistantMessage?.tool_calls) ? assistantMessage.tool_calls : [];
       if (tuningEnabled && toolCalls.length) {
@@ -2089,6 +2098,15 @@ async function callPollinationsModel(env,db,messages,maxTokens=550) {
           continue;
         }
         data = await response.json();
+        if (data?.error) {
+          const errorCode = Number(data.error.code || data.error.status) || 0;
+          const detail = String(data.error.message || data.error.code || "unspecified provider error").slice(0, 110);
+          await recordModelResult(env, id, Date.now() - started, false);
+          recorded = true;
+          lastFailure = id + " returned provider error " + (errorCode || 200) + " after settings adjustment: " + detail;
+          console.log(JSON.stringify({ event: "pollinations_provider_error", model: id, http_status: errorCode || 200, stage: "post_settings", error: detail }));
+          continue;
+        }
         assistantMessage = data.choices?.[0]?.message;
       }
 
@@ -2278,6 +2296,14 @@ function openRouterUsage(data) {
   };
 }
 
+function retryAfterDelayMs(value, now = Date.now()) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  const timestamp = Date.parse(raw);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - now) : 0;
+}
 function openRouterErrorDetail(value) {
   return String(value || "").replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").slice(0, 170);
 }
@@ -2370,12 +2396,29 @@ async function openRouterCompletion(env, modelId, messages, settings, ownerSelec
     }
 
     if ([408, 429, 500, 502, 503, 504].includes(response.status) && attempt < 2) {
-      let delay = Number(response.headers.get("retry-after")) * 1000;
-      if (!Number.isFinite(delay) || delay <= 0) delay = 450;
-      delay = Math.max(150, Math.min(800, delay));
-      console.log(JSON.stringify({ event: "openrouter_retry", model: modelId, status: response.status, attempt }));
-      await new Promise(resolve => setTimeout(resolve, delay));
-      continue;
+      const retryAfterMs = retryAfterDelayMs(response.headers.get("retry-after"));
+      const deferToFallback = [429, 503].includes(response.status) && retryAfterMs > 1800;
+      if (deferToFallback) {
+        console.log(JSON.stringify({
+          event: "openrouter_retry_deferred_to_fallback",
+          model: modelId,
+          status: response.status,
+          retry_after_ms: retryAfterMs,
+          attempt
+        }));
+      } else {
+        const delay = Math.max(150, Math.min(1800, retryAfterMs || 450));
+        console.log(JSON.stringify({
+          event: "openrouter_retry",
+          model: modelId,
+          status: response.status,
+          retry_after_ms: retryAfterMs || null,
+          delay_ms: delay,
+          attempt
+        }));
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
     }
     if (!response.ok) {
       let detail = "";
@@ -3853,6 +3896,8 @@ export class DiscordGateway extends DurableObject {
     this.channelActive = new Map();
     this.channelLastStartedAt = new Map();
     this.channelQueueTimers = new Map();
+    this.globalActiveRequests = 0;
+    this.globalMaxRequests = 5;
   }
 
   async fetch(request) {
@@ -4484,6 +4529,7 @@ if (path === "/issues/draft/complete" && request.method === "POST") {
       return;
     }
     if ((this.channelActive.get(channelId) || 0) >= 5) return;
+    if (this.globalActiveRequests >= this.globalMaxRequests) return;
     const wait = Math.max(0, 2000 - (Date.now() - (this.channelLastStartedAt.get(channelId) || 0)));
     if (wait > 0) {
       if (!this.channelQueueTimers.has(channelId)) {
@@ -4497,6 +4543,7 @@ if (path === "/issues/draft/complete" && request.method === "POST") {
     const item = queue.shift();
     if (!queue.length) this.channelQueues.delete(channelId);
     this.channelActive.set(channelId, (this.channelActive.get(channelId) || 0) + 1);
+    this.globalActiveRequests++;
     this.channelLastStartedAt.set(channelId, Date.now());
     Promise.resolve().then(() => handleMention(this.env, item.message)).catch(async error => {
       const detail = String(error?.message || error).slice(0, 160);
@@ -4507,7 +4554,12 @@ if (path === "/issues/draft/complete" && request.method === "POST") {
       const active = Math.max(0, (this.channelActive.get(channelId) || 1) - 1);
       if (active) this.channelActive.set(channelId, active);
       else this.channelActive.delete(channelId);
+      this.globalActiveRequests = Math.max(0, this.globalActiveRequests - 1);
       this.pumpChannelQueue(channelId);
+      // A completion in one channel can free a global slot for another channel.
+      for (const otherChannelId of this.channelQueues.keys()) {
+        if (otherChannelId !== channelId) this.pumpChannelQueue(otherChannelId);
+      }
     });
     if (this.channelQueues.get(channelId)?.length && !this.channelQueueTimers.has(channelId)) {
       this.channelQueueTimers.set(channelId, setTimeout(() => {
