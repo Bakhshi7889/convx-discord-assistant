@@ -47,11 +47,11 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-24-r38";
+const CONVY_BUILD_VERSION = "convx-2026-10-24-r39";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Add an opt-in Vercel AI Gateway fallback that verifies the live model catalog, text modality, and zero input/output prices before inference.",
-  "Reject missing, malformed, variable-provider, and nonzero model pricing; disable Vercel routing by default until a secret and explicit opt-in are configured.",
-  "Expose Vercel fallback configuration and cached pricing-verification status without revealing API key values."
+  "Fail closed on any unknown or unpriced Vercel pricing dimension, keeping the zero-cost route restricted to explicit numeric-zero prices.",
+  "Keep the Vercel fallback opt-in and disabled unless its server-side key and configuration flag are both present.",
+  "Preserve the existing OpenRouter-first routing, Pollinations fallback, model diagnostics, memory, queues, and GitHub issue workflow."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -2258,27 +2258,17 @@ function isExplicitZeroPrice(value) {
 }
 
 function vercelPricingIsStrictlyFree(pricing) {
+  // Both token directions must be explicitly zero, not absent or inferred.
   if (!pricing || !isExplicitZeroPrice(pricing.input) || !isExplicitZeroPrice(pricing.output)) return false;
-  if (pricing.varies_by_provider === true) return false;
   for (const [key, value] of Object.entries(pricing)) {
     if (key === "input" || key === "output") continue;
     if (key === "varies_by_provider") {
       if (value !== false) return false;
       continue;
     }
-    // Fail closed if new price dimensions appear in the catalog. This route has
-    // no allowance for cache, media, tool, or provider-specific charges.
-    if (value === null || value === "") continue;
-    if (typeof value === "boolean") {
-      if (value !== false) return false;
-      continue;
-    }
-    if (typeof value === "string" || typeof value === "number") {
-      if (!isExplicitZeroPrice(value)) return false;
-      continue;
-    }
-    if (Array.isArray(value) && value.length === 0) continue;
-    return false;
+    // Any additional price dimension must itself be explicitly numeric zero.
+    // Null, empty, boolean, array, object, unknown, or positive values fail closed.
+    if (!isExplicitZeroPrice(value)) return false;
   }
   return true;
 }
