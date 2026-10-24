@@ -37,7 +37,13 @@ If duplicate searching fails, CONVY fails closed and does not create or comment 
 
 The default primary provider is OpenRouter with `liquid/lfm-2.5-2.6b:free`. Configure the model through `OPENROUTER_MODEL` and provider priority through `PRIMARY_MODEL_PROVIDER`; both are non-secret Worker variables in `wrangler.toml`. Before sending a request, the Worker verifies the configured model's ID, text modality, and explicit zero prompt/completion pricing against OpenRouter's model metadata. Successful checks are cached for 15 minutes in Durable Object storage, not D1. Model IDs that are not a `:free` variant or whose current prices cannot be confirmed as zero are rejected.
 
-Store the OpenRouter key only as the Cloudflare Worker secret `OPENROUTER_API_KEY`. Never put it in source code, `wrangler.toml`, GitHub commits, or chat. The code retries transient OpenRouter timeouts, rate limits, and provider errors once, then falls back to the existing Pollinations model route. A missing OpenRouter key also causes Pollinations fallback, and `/health` and `!runtime` show whether the secret is configured without revealing it. Explicit `!model 1-15` selections continue to use the existing Pollinations models; `!model auto` restores OpenRouter as the default text primary. The configured LFM model is text-only, so image requests continue to the explicit Pollinations vision-capable set.
+Store the OpenRouter key only as the Cloudflare Worker secret `OPENROUTER_API_KEY`. Never put it in source code, `wrangler.toml`, GitHub commits, or chat. The code retries transient OpenRouter timeouts, rate limits, and provider errors once, then tries other OpenRouter models only after verifying their live text prices are zero. It next tries the optional Vercel free-model fallback and then the existing Pollinations route. A missing OpenRouter key also causes the same safe fallback sequence. `/health` and `!provider` show secret presence and pricing-verification state without revealing key values. Explicit `!model 1-15` selections continue to use the existing Pollinations models; `!model auto` restores OpenRouter as the default text primary. The configured LFM model is text-only, so image requests continue to the explicit Pollinations vision-capable set.
+
+### Optional Vercel AI Gateway fallback (disabled by default)
+
+The reviewed candidate is `reflection/beam-free`. The Worker requests `https://ai-gateway.vercel.sh/v1/models` and checks that the exact model is present, text input/output are supported, the catalog still tags it `free`, both input and output prices are explicitly zero, and no extra/variable price dimensions are present. Verification results are cached in Durable Object storage for five minutes; failed checks are briefly cached for one minute. When the catalog cannot be verified, no Vercel inference request is sent. The normal paid alias `reflection/beam` is not allowlisted. The model list is checked again after the cache expires, so a price change disables the route rather than silently moving CONVY to a paid model.
+
+To enable it, store a Vercel AI Gateway key as the Cloudflare Worker secret `VERCEL_AI_GATEWAY_API_KEY`, then change `VERCEL_AI_GATEWAY_ENABLED` to `"true"` and deploy. Never paste the key into chat or commit it. The default remains disabled until both the secret and explicit enable flag are configured. Vercel’s live catalog currently reports no ZDR/no-training guarantee for this model; requests include CONVY’s system instructions and relevant Discord context. Do not enable it unless you accept Reflection/Vercel’s current data-handling terms. Image messages and explicit `!model` overrides do not use this fallback.
 
 **Privacy note:** OpenRouter's listing for this Liquid model says prompts and outputs may be retained and used to train Liquid models. CONVY sends its system instructions and relevant conversation context to the provider. Do not route secrets or sensitive personal/private information through this model.
 
@@ -62,11 +68,14 @@ Database ID: `9da42b8b-4129-40bf-b19a-d76acb7ee801`
 The deployed Worker is `convx-discord-assistant`. Required Worker secrets:
 - `DISCORD_TOKEN`
 - `POLLINATIONS_API_KEY`
-- `OPENROUTER_API_KEY` (required for the OpenRouter primary; without it the Worker uses the Pollinations fallback)
+- `OPENROUTER_API_KEY` (required for the OpenRouter primary; without it the Worker continues through configured zero-cost fallbacks)
+- `VERCEL_AI_GATEWAY_API_KEY` (optional; only needed when the Vercel fallback is deliberately enabled)
 
 Worker variables:
 - `PRIMARY_MODEL_PROVIDER` (`openrouter` by default; can be set to `pollinations`)
 - `OPENROUTER_MODEL` (defaults to `liquid/lfm-2.5-2.6b:free`; use only verified free IDs)
+- `VERCEL_AI_GATEWAY_ENABLED` (defaults to `false`; use `true` only after configuring its secret and accepting the model provider’s data-handling terms)
+- `VERCEL_FREE_MODEL` (reviewed candidate `reflection/beam-free`; requests are rejected unless the live Vercel catalog confirms zero prices and text modality)
 - `TARGET_CHANNEL_ID`
 - `BOT_USER_ID`
 - `GUILD_ID`
