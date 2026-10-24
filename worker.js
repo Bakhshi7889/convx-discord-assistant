@@ -48,7 +48,7 @@ const CONVY_CURRENT_RELEASE_NOTES = [
   "Improve resilience to intermittent free-model rate limits by honoring Retry-After and failing over to other verified-free models instead of retrying too early.",
   "Limit concurrent model requests globally across channels, not just within each channel, to reduce bursts against free providers.",
   "Detect structured provider errors in HTTP 200 Pollinations responses and log the real failure reason without exposing it in public chat."
-]];
+];
 const CONVY_RELEASE_HISTORY = [
   {
     version: "convx-2026-10-18-r21",
