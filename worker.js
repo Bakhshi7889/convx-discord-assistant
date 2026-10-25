@@ -3,10 +3,6 @@ import { DurableObject } from "cloudflare:workers";
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
 const OPENROUTER_API = "https://openrouter.ai/api/v1";
-const VERCEL_AI_GATEWAY_API = "https://ai-gateway.vercel.sh/v1";
-const VERCEL_DEFAULT_FREE_MODEL = "reflection/beam-free";
-const VERCEL_FREE_MODEL_ALLOWLIST = new Set([VERCEL_DEFAULT_FREE_MODEL]);
-const VERCEL_MODEL_CHECK_CACHE_MS = 5 * 60 * 1000;
 const CONVY_ISSUES_REPOSITORY = "cosmictaserdev-creator/Convx";
 const ISSUE_DRAFT_TTL_MS = 10 * 60 * 1000;
 const ISSUE_CREATE_RATE_LIMIT = 2;
@@ -47,11 +43,11 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-24-r39";
+const CONVY_BUILD_VERSION = "convx-2026-10-25-r40";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Fail closed on any unknown or unpriced Vercel pricing dimension, keeping the zero-cost route restricted to explicit numeric-zero prices.",
-  "Keep the Vercel fallback opt-in and disabled unless its server-side key and configuration flag are both present.",
-  "Preserve the existing OpenRouter-first routing, Pollinations fallback, model diagnostics, memory, queues, and GitHub issue workflow."
+  "Remove the unused third-party gateway route and pricing cache; keep the existing OpenRouter-first and Pollinations fallback chain.",
+  "Preserve strict zero-price verification for existing inference routes and avoid creating additional provider credentials or billing dependencies.",
+  "Keep conversation memory, queueing, diagnostics, model commands, and GitHub issue workflows unchanged."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -1911,8 +1907,6 @@ function withRuntimeSnapshot(env, messages, modelId, settings, hasImages, tuning
     "Configured primary provider: " + String(env.PRIMARY_MODEL_PROVIDER || DEFAULT_PRIMARY_MODEL_PROVIDER),
     "Configured OpenRouter model: " + String(env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL),
     "Pollinations fallback order: " + PREFERRED_MODEL_ORDER.join(" -> "),
-    "Vercel zero-price fallback enabled: " + (env.VERCEL_AI_GATEWAY_ENABLED === "true" && Boolean(env.VERCEL_AI_GATEWAY_API_KEY) ? "yes" : "no"),
-    "Vercel fallback candidate: " + configuredVercelFreeModel(env) + " (must pass live zero-price verification)",
     "Images included in this request: " + (hasImages ? "yes" : "no"),
     "Response settings currently applied: " + JSON.stringify(settings),
     "Per-reply setting adjustment tool available: " + (tuningEnabled ? "yes, adjust_response_settings" : "no"),
@@ -2234,299 +2228,6 @@ async function verifyOpenRouterFreeModel(env, modelId) {
   };
   await saveOpenRouterModelStatus(env, status);
   return status;
-}
-
-async function saveVercelModelStatus(env, status) {
-  try {
-    await gatewayControl(env, "/providers/vercel/model-status", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(status)
-    });
-  } catch (error) {
-    console.log("Vercel model-status cache write skipped: " + String(error.message || error).slice(0, 100));
-  }
-}
-
-function configuredVercelFreeModel(env) {
-  return String(env.VERCEL_FREE_MODEL || VERCEL_DEFAULT_FREE_MODEL).trim();
-}
-
-function isExplicitZeroPrice(value) {
-  return value !== undefined && value !== null && value !== "" &&
-    Number.isFinite(Number(value)) && Number(value) === 0;
-}
-
-function vercelPricingIsStrictlyFree(pricing) {
-  // Both token directions must be explicitly zero, not absent or inferred.
-  if (!pricing || !isExplicitZeroPrice(pricing.input) || !isExplicitZeroPrice(pricing.output)) return false;
-  for (const [key, value] of Object.entries(pricing)) {
-    if (key === "input" || key === "output") continue;
-    if (key === "varies_by_provider") {
-      if (value !== false) return false;
-      continue;
-    }
-    // Any additional price dimension must itself be explicitly numeric zero.
-    // Null, empty, boolean, array, object, unknown, or positive values fail closed.
-    if (!isExplicitZeroPrice(value)) return false;
-  }
-  return true;
-}
-
-async function verifyVercelFreeModel(env, modelId) {
-  if (!env.VERCEL_AI_GATEWAY_API_KEY) throw new Error("VERCEL_AI_GATEWAY_API_KEY is not configured in the Cloudflare Worker.");
-  if (!VERCEL_FREE_MODEL_ALLOWLIST.has(modelId)) {
-    throw new Error("The Vercel fallback model is not on CONVY's reviewed free-model allowlist.");
-  }
-
-  const now = Date.now();
-  let cached = null;
-  try {
-    const result = await gatewayControl(env, "/providers/vercel/model-status?model=" + encodeURIComponent(modelId));
-    cached = result?.status || null;
-  } catch {}
-  if (cached && cached.modelId === modelId && Number(cached.checkedAt) > 0) {
-    const age = now - Number(cached.checkedAt);
-    const ttl = cached.verified === true ? VERCEL_MODEL_CHECK_CACHE_MS : 60 * 1000;
-    if (age >= 0 && age < ttl) {
-      if (cached.verified === true) return cached;
-      throw new Error(String(cached.reason || "Vercel model pricing was not verified as free."));
-    }
-  }
-
-  const failStatus = async reason => {
-    const status = {
-      modelId,
-      checkedAt: Date.now(),
-      verified: false,
-      inputPrice: null,
-      outputPrice: null,
-      contextLength: 0,
-      reason: String(reason).slice(0, 180)
-    };
-    await saveVercelModelStatus(env, status);
-    throw new Error(status.reason);
-  };
-
-  let response;
-  try {
-    response = await fetch(VERCEL_AI_GATEWAY_API + "/models", {
-      method: "GET",
-      headers: {
-        "Authorization": "Bearer " + env.VERCEL_AI_GATEWAY_API_KEY,
-        "Accept": "application/json"
-      },
-      signal: AbortSignal.timeout(6500)
-    });
-  } catch {
-    throw new Error("Vercel's live model and price catalog could not be checked; no Vercel inference request was sent.");
-  }
-  if (!response.ok) return failStatus("Vercel model catalog returned HTTP " + response.status + ".");
-  let payload;
-  try { payload = await response.json(); }
-  catch { return failStatus("Vercel returned unreadable model metadata."); }
-
-  const rows = Array.isArray(payload?.data) ? payload.data : [];
-  const info = rows.find(row => String(row?.id || "") === modelId);
-  if (!info) return failStatus("The reviewed Vercel free model is absent from the current catalog.");
-  if (info.type !== "language" ||
-      !Array.isArray(info.modalities?.input) || !info.modalities.input.includes("text") ||
-      !Array.isArray(info.modalities?.output) || !info.modalities.output.includes("text")) {
-    return failStatus("Vercel's live model metadata does not confirm text input and output.");
-  }
-  if (!Array.isArray(info.tags) || !info.tags.includes("free")) {
-    return failStatus("Vercel's live model catalog no longer marks this model as free.");
-  }
-  if (info.deprecated_at !== undefined && info.deprecated_at !== null && Number(info.deprecated_at) > now) {
-    return failStatus("Vercel's live model catalog marks this model as deprecated.");
-  }
-  if (!vercelPricingIsStrictlyFree(info.pricing)) {
-    return failStatus("Vercel's live model pricing is not explicitly zero for every listed price dimension.");
-  }
-
-  const status = {
-    modelId,
-    checkedAt: Date.now(),
-    verified: true,
-    inputPrice: 0,
-    outputPrice: 0,
-    contextLength: Math.max(0, Number(info.context_window) || 0),
-    reason: ""
-  };
-  await saveVercelModelStatus(env, status);
-  return status;
-}
-
-async function vercelGatewayCompletion(env, modelId, messages, settings, useTools) {
-  let response;
-  try {
-    response = await fetch(VERCEL_AI_GATEWAY_API + "/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": "Bearer " + env.VERCEL_AI_GATEWAY_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages,
-        temperature: settings.temperature,
-        max_tokens: settings.max_tokens,
-        ...(useTools ? { tools: RESPONSE_SETTINGS_TOOL, tool_choice: "auto" } : {})
-      }),
-      signal: AbortSignal.timeout(MODEL_TIMEOUT_MS)
-    });
-  } catch {
-    const failure = new Error("Vercel AI Gateway request failed or timed out.");
-    failure.status = 0;
-    throw failure;
-  }
-
-  let data;
-  try { data = await response.json(); }
-  catch {
-    const failure = new Error("Vercel AI Gateway returned unreadable completion data.");
-    failure.status = response.status;
-    throw failure;
-  }
-  if (!response.ok || data?.error) {
-    const detail = openRouterErrorDetail(data?.error?.message || data?.message || "unspecified provider error");
-    const status = Number(data?.error?.status || data?.error?.code || response.status) || response.status || 502;
-    const failure = new Error("Vercel AI Gateway returned HTTP " + response.status + ": " + detail);
-    failure.status = status;
-    throw failure;
-  }
-  return data;
-}
-
-async function callVercelFreeModel(env, db, messages, maxTokens = 550) {
-  if (env.VERCEL_AI_GATEWAY_ENABLED !== "true") {
-    throw new Error("Vercel AI Gateway fallback is disabled by configuration.");
-  }
-  if (!env.VERCEL_AI_GATEWAY_API_KEY) {
-    throw new Error("VERCEL_AI_GATEWAY_API_KEY is missing.");
-  }
-  const modelId = configuredVercelFreeModel(env);
-  const hasImages = messages.some(message =>
-    Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
-  );
-  if (hasImages) throw new Error("Vercel's reviewed fallback is text-only.");
-
-  const started = Date.now();
-  let recorded = false;
-  try {
-    const verification = await verifyVercelFreeModel(env, modelId);
-    const ownerSelectedId = await setting(db, "owner_selected_model_id");
-    const configuredReasoning = await setting(db, "reasoning_override");
-    const configuredTemperature = await setting(db, "temperature_override");
-    const configuredMaxTokens = await setting(db, "max_tokens_override");
-    const lockedSettings = {};
-    if (["low", "medium", "high"].includes(String(configuredReasoning || ""))) lockedSettings.reasoning_effort = String(configuredReasoning);
-    if (configuredTemperature !== null && configuredTemperature !== "" && Number.isFinite(Number(configuredTemperature)) && Number(configuredTemperature) >= 0 && Number(configuredTemperature) <= 1) lockedSettings.temperature = Number(configuredTemperature);
-    if (configuredMaxTokens !== null && configuredMaxTokens !== "" && Number.isInteger(Number(configuredMaxTokens)) && Number(configuredMaxTokens) >= 100 && Number(configuredMaxTokens) <= 900) lockedSettings.max_tokens = Number(configuredMaxTokens);
-
-    const query = requestText(messages);
-    const initialSettings = { ...initialResponseSettings(query, maxTokens, false), ...lockedSettings };
-    const currentSettings = {
-      temperature: initialSettings.temperature,
-      max_tokens: initialSettings.max_tokens
-    };
-    let conversation = [...messages];
-    const completion = (thread, useTools) => vercelGatewayCompletion(
-      env,
-      modelId,
-      withRuntimeSnapshot(env, thread, modelId, {
-        ...currentSettings,
-        reasoning_effort: initialSettings.reasoning_effort
-      }, false, Boolean(useTools), ownerSelectedId),
-      currentSettings,
-      useTools
-    );
-
-    let data = await completion(conversation, true);
-    let assistantMessage = data.choices?.[0]?.message;
-    const toolCalls = Array.isArray(assistantMessage?.tool_calls) ? assistantMessage.tool_calls : [];
-    if (toolCalls.length) {
-      conversation.push({
-        role: "assistant",
-        content: assistantMessage.content || null,
-        tool_calls: toolCalls
-      });
-      const acceptedCalls = toolCalls.slice(0, 1);
-      for (const toolCall of toolCalls) {
-        let toolResult;
-        if (toolCall === acceptedCalls[0] && toolCall?.function?.name === "adjust_response_settings") {
-          const applied = parseOpenRouterTuningArgs(toolCall.function.arguments, currentSettings, {
-            temperature: lockedSettings.temperature,
-            max_tokens: lockedSettings.max_tokens
-          });
-          currentSettings.temperature = applied.settings.temperature;
-          currentSettings.max_tokens = applied.settings.max_tokens;
-          toolResult = applied.result;
-        } else {
-          toolResult = { ok: false, error: "Only one local adjust_response_settings call is allowed per reply." };
-        }
-        conversation.push({
-          role: "tool",
-          tool_call_id: String(toolCall.id || "settings-tool"),
-          content: JSON.stringify(toolResult)
-        });
-      }
-      data = await completion(conversation, false);
-      assistantMessage = data.choices?.[0]?.message;
-    }
-
-    const rawAnswer = assistantMessage?.content;
-    const answer = typeof rawAnswer === "string"
-      ? rawAnswer.trim()
-      : Array.isArray(rawAnswer)
-        ? rawAnswer.filter(part => part?.type === "text" && part.text).map(part => String(part.text)).join("").trim()
-        : "";
-    if (!answer) {
-      const failure = new Error("Vercel AI Gateway returned an empty answer.");
-      failure.status = 502;
-      throw failure;
-    }
-
-    const elapsed = Date.now() - started;
-    await recordModelResult(env, modelId, elapsed, true);
-    recorded = true;
-    const usage = openRouterUsage(data);
-    console.log(JSON.stringify({
-      event: "model_request",
-      provider: "vercel_ai_gateway",
-      model: modelId,
-      outcome: "success",
-      latency_ms: elapsed,
-      prompt_tokens: usage.promptTokens,
-      completion_tokens: usage.completionTokens,
-      cached_prompt_tokens: usage.cachedPromptTokens,
-      total_tokens: usage.totalTokens,
-      catalog_verified_free: verification.verified === true
-    }));
-    return {
-      content: answer,
-      modelId,
-      provider: "vercel_ai_gateway",
-      usage,
-      settings: { ...currentSettings, reasoning_effort: initialSettings.reasoning_effort },
-      buildVersion: CONVY_BUILD_VERSION
-    };
-  } catch (error) {
-    if (!recorded) {
-      try { await recordModelResult(env, modelId, Date.now() - started, false); } catch {}
-    }
-    console.log(JSON.stringify({
-      event: "model_request",
-      provider: "vercel_ai_gateway",
-      model: modelId,
-      outcome: "failure",
-      latency_ms: Date.now() - started,
-      http_status: Number(error?.status) || null,
-      error: openRouterErrorDetail(error?.message || error)
-    }));
-    throw error;
-  }
 }
 
 // Discovery only: alternate candidates must advertise :free and numeric zero prices.
@@ -2936,25 +2637,13 @@ async function callFreeModel(env, db, messages, maxTokens = 550) {
         console.log("OpenRouter free fallback discovery failed: " + openRouterErrorDetail(error?.message || error));
       }
     }
-    let vercelError = "disabled or key missing";
-    if (env.VERCEL_AI_GATEWAY_ENABLED === "true" && env.VERCEL_AI_GATEWAY_API_KEY) {
-      try {
-        const fallback = await callVercelFreeModel(env, db, messages, maxTokens);
-        return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
-      } catch (error) {
-        vercelError = openRouterErrorDetail(error?.message || error);
-        console.log("Vercel zero-price fallback failed; moving to Pollinations: " + vercelError);
-      }
-    } else {
-      console.log("Vercel zero-price fallback skipped: explicit enable flag and API key are both required.");
-    }
     try {
       const fallback = await callPollinationsModel(env, db, messages, maxTokens);
       return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
     } catch (error) {
       const fallbackError = openRouterErrorDetail(error?.message || error);
       const detail = "Primary " + primaryId + ": " + (primaryError || "unavailable") +
-        "; Vercel fallback: " + vercelError + "; Pollinations fallback: " + (fallbackError || "unavailable");
+        "; Pollinations fallback: " + (fallbackError || "unavailable");
       console.log(JSON.stringify({ event: "model_stack_failure", provider: "openrouter", model: primaryId, detail: detail.slice(0, 800) }));
       throw new Error("No verified free text model is available right now. Please retry shortly.");
     }
@@ -3838,19 +3527,6 @@ async function handleMention(env, message) {
     const modelId = configuredOpenRouterModel(env);
     const hasKey = Boolean(env.OPENROUTER_API_KEY);
     const selected = await setting(env.DB, "owner_selected_model_id");
-    const vercelEnabled = env.VERCEL_AI_GATEWAY_ENABLED === "true";
-    const hasVercelKey = Boolean(env.VERCEL_AI_GATEWAY_API_KEY);
-    const vercelModel = configuredVercelFreeModel(env);
-    let vercelStatusText = "not checked yet";
-    try {
-      const status = await gatewayControl(env, "/providers/vercel/model-status?model=" + encodeURIComponent(vercelModel));
-      const cached = status?.status;
-      if (cached && cached.modelId === vercelModel) {
-        vercelStatusText = cached.verified === true
-          ? "verified free at " + new Date(Number(cached.checkedAt)).toISOString()
-          : "last check failed: " + String(cached.reason || "unknown reason").slice(0, 150);
-      }
-    } catch {}
     let statusText = "not checked in this command";
     try {
       const status = await gatewayControl(env, "/providers/openrouter/model-status?model=" + encodeURIComponent(modelId));
@@ -3868,12 +3544,8 @@ async function handleMention(env, message) {
       "Configured OpenRouter model: " + modelId + "\n" +
       "OpenRouter key present: " + (hasKey ? "yes (value hidden)" : "NO") + "\n" +
       "Cached free-price verification: " + statusText + "\n" +
-      "Vercel fallback enabled: " + (vercelEnabled ? "yes" : "no (explicit opt-in required)") + "\n" +
-      "Vercel AI Gateway key present: " + (hasVercelKey ? "yes (value hidden)" : "no") + "\n" +
-      "Vercel free model: " + vercelModel + "\n" +
-      "Vercel cached free-price verification: " + vercelStatusText + "\n" +
       "Manual model override: " + (selected || "none, automatic primary routing") + "\n" +
-      "Routing note: explicit model overrides use Pollinations; image requests currently use Pollinations vision models. Vercel is text-only and is attempted only when enabled and live zero-price checks pass. Check Worker logs for the exact provider/model event.",
+      "Routing note: explicit model overrides use Pollinations; image requests currently use Pollinations vision models. Check Worker logs for the exact provider/model event.",
       message.id);
     return;
   }
@@ -4260,33 +3932,6 @@ export class DiscordGateway extends DurableObject {
       } catch (error) {
         return json({ ok: false, error: String(error.message || error).slice(0, 140) }, 500);
       }
-    }
-    if (path === "/providers/vercel/model-status" && request.method === "GET") {
-      const modelId = String(new URL(request.url).searchParams.get("model") || "");
-      if (!VERCEL_FREE_MODEL_ALLOWLIST.has(modelId)) {
-        return json({ ok: false, error: "A reviewed Vercel free model ID is required." }, 400);
-      }
-      const status = await this.ctx.storage.get("vercel_model_status:" + modelId) || null;
-      return json({ ok: true, status });
-    }
-    if (path === "/providers/vercel/model-status" && request.method === "POST") {
-      let body = {};
-      try { body = await request.json(); } catch {}
-      const modelId = String(body.modelId || "");
-      if (!VERCEL_FREE_MODEL_ALLOWLIST.has(modelId)) {
-        return json({ ok: false, error: "A reviewed Vercel free model ID is required." }, 400);
-      }
-      const status = {
-        modelId,
-        checkedAt: Math.max(0, Number(body.checkedAt) || Date.now()),
-        verified: body.verified === true,
-        inputPrice: body.inputPrice === undefined ? null : Number(body.inputPrice),
-        outputPrice: body.outputPrice === undefined ? null : Number(body.outputPrice),
-        contextLength: Math.max(0, Number(body.contextLength) || 0),
-        reason: String(body.reason || "").slice(0, 180)
-      };
-      await this.ctx.storage.put("vercel_model_status:" + modelId, status);
-      return json({ ok: true, status });
     }
     if (path === "/providers/openrouter/model-status" && request.method === "GET") {
       const modelId = String(new URL(request.url).searchParams.get("model") || "");
@@ -5002,9 +4647,6 @@ export default {
           discordToken: Boolean(env.DISCORD_TOKEN),
           pollinationsKey: Boolean(env.POLLINATIONS_API_KEY),
           openRouterKey: Boolean(env.OPENROUTER_API_KEY),
-          vercelAiGatewayKey: Boolean(env.VERCEL_AI_GATEWAY_API_KEY),
-          vercelAiGatewayEnabled: env.VERCEL_AI_GATEWAY_ENABLED === "true",
-          vercelFreeModel: configuredVercelFreeModel(env),
           primaryModelProvider: configuredPrimaryProvider(env),
           openRouterModel: configuredOpenRouterModel(env),
           channelId: Boolean(env.TARGET_CHANNEL_ID),
