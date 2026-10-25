@@ -50,8 +50,10 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-25-r42";
+const CONVY_BUILD_VERSION = "convx-2026-10-25-r43";
 const CONVY_CURRENT_RELEASE_NOTES = [
+  "Guard identity-question replies against impersonating known members or falsely assigning developer/owner roles; route corrections to the verified creator identity.",
+  "Explain when !model is given an automatic OpenRouter/Groq/Mistral provider model instead of a Pollinations catalog choice; support !providers as an alias for !provider.",
   "Ground recent channel history in Discord author IDs and add stricter rules against impersonating members or inventing ownership/developer claims.",
   "Expand natural-language web-search detection to catch requests like finding a profile on the internet.",
   "Add Groq fallback models in order: Qwen 3.8 27B with reasoning disabled, GPT-OSS 120B with low reasoning, then GPT-OSS 20B with low reasoning.",
@@ -133,6 +135,8 @@ const CONVY_RELEASE_HISTORY = [
   }
 ];
 const CONVY_RELEASE_NOTES = [
+  "Add a last-resort correction for identity questions when the generated reply impersonates a member or attributes an unverified developer/owner role.",
+  "Clarify that !model changes Pollinations overrides, while OpenRouter/Groq/Mistral are part of automatic provider routing; accept !providers as a diagnostic alias.",
   "Ground speaker history in Discord user IDs and strengthen identity/ownership anti-hallucination rules.",
   "Recognize natural-language requests to find people or profiles online as web-search intent.",
   "Added recent channel conversation context, saved CONVY replies, and owner-approved long-term memories.",
@@ -2974,6 +2978,52 @@ function buildMultimodalUserContent(query, currentMessage, referencedMessage, re
   return parts.length > 1 ? parts : String(query || "");
 }
 
+function isIdentityQuestion(query) {
+  const value = String(query || "");
+  return /\bwho\b[\s\S]{0,80}\b(?:is|are)\b/i.test(value) ||
+    /\bwho['’]s\b/i.test(value) ||
+    /\b(?:who built|who owns|who made|who created|who runs)\b/i.test(value);
+}
+function identityQuestionSubject(query) {
+  const match = String(query || "").match(/\bwho\b[\s\S]{0,80}\b(?:is|are)\s+(.+?)(?:[?!\.\n]|$)/i);
+  return match ? String(match[1] || "").trim().replace(/^[\s"'\x60]+|[\s"'\x60]+$/g, "").slice(0, 100) : "";
+}
+function recentMemberByName(context, subject) {
+  const target = normalize(String(subject || "").replace(/^(?:the|a|an)\s+/i, ""));
+  if (!target || /^(?:owner|creator|developer|dev|maintainer|bot|admin|mod|moderator)$/i.test(target)) return null;
+  const messages = [...(context.messages || [])].reverse();
+  return messages.find(item => {
+    const name = normalize(item.author_name || "");
+    return name && (name === target || name.startsWith(target + " ") || target.startsWith(name + " "));
+  }) || null;
+}
+function hasIdentityMisattribution(query, answer, context) {
+  if (!isIdentityQuestion(query)) return false;
+  const text = String(answer || "");
+  if (/\b(?:that's|that is|it's|it is)\s+me\b/i.test(text) ||
+      /\byou(?:'re| are)\s+(?:literally\s+)?talking to\s+(?:the\s+)?(?:dev(?:eloper)?|owner|creator|maintainer)\b/i.test(text) ||
+      /\b(?:i am|i'm|i’m)\s+(?:literally\s+)?(?:the\s+)?(?:dev(?:eloper)?|owner|creator|maintainer)\b/i.test(text)) return true;
+  const subject = identityQuestionSubject(query);
+  const target = normalize(String(subject || "").replace(/^(?:the|a|an)\s+/i, ""));
+  if (!target || /^(?:bakhshi|b a k h s h i|owner|creator|developer|dev|maintainer)$/i.test(target)) return false;
+  const member = recentMemberByName(context, subject);
+  if (!member) return false;
+  const answerText = normalize(text);
+  const authorityClaim = /\b(?:owner|developer|dev|creator|maintainer|built|created|owns|runs)\b/i.test(text);
+  return authorityClaim && answerText.includes(target);
+}
+function groundedIdentityCorrection(query, context) {
+  const subject = identityQuestionSubject(query);
+  if (/\b(?:owner|creator|developer|dev|maintainer|bot)\b/i.test(subject)) {
+    return "The confirmed creator and maintainer of CONVY is Bakhshi (@B A K H S H I). I’m CONVY, the bot, not the developer or a Discord member being discussed.";
+  }
+  const member = recentMemberByName(context, subject);
+  if (member) {
+    const name = String(member.author_name || subject || "That member").trim().slice(0, 80);
+    return name + " is the member using that name in this channel. I don't have verified information that they're the developer or owner. The confirmed creator and maintainer of CONVY is Bakhshi (@B A K H S H I).";
+  }
+  return "I don't have verified information about " + (subject ? '"' + subject.replace(/["\r\n]/g, "").slice(0, 80) + '"' : "that person") + " from the available chat. The confirmed creator and maintainer of CONVY is Bakhshi (@B A K H S H I); I shouldn't guess beyond that.";
+}
 async function generateAnswer(env,db,query,channelId,sourceMessage=null, options = {}) {
   const referenced = sourceMessage ? await fetchReferencedMessage(env, db, sourceMessage) : null;
   let recentImageMatch = null;
@@ -3086,7 +3136,16 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
     { role: "system", content: system },
     { role: "user", content: userContent }
   ]);
-  return result.content.trim();
+  const answer = result.content.trim();
+  if (hasIdentityMisattribution(query, answer, context)) {
+    console.log(JSON.stringify({
+      event: "identity_misattribution_blocked",
+      channel_id: String(channelId || ""),
+      model: String(result.modelId || "unknown")
+    }));
+    return groundedIdentityCorrection(query, context);
+  }
+  return answer;
 }
 
 function isSaveRequest(q){return /\b(save\s+(?:this|that|it|answer|info)|remember\s+(?:this|that|it)|add\s+(?:this|that)\s+to\s+(?:the\s+)?(?:knowledge|memory)|store\s+(?:this|that))\b/i.test(String(q||""));}
@@ -3670,13 +3729,46 @@ async function handleMention(env, message) {
       const selected = await setting(env.DB, "owner_selected_model_id");
       const title = selected ? "Current override: " + selected : "Current mode: AUTO, using the preferred order.";
       await sendUserReply(env, message,
-        title + "\nUse !model 1 through !model 5 for the preferred ranking, or !model 6 through !model 15 for other listed green models. Use !model auto to restore automatic routing. Image requests stay on the explicitly configured vision-capable models.",
+        title + "\n!model controls manual Pollinations overrides only. Use !model 1 through !model 5 for the preferred ranking, or !model 6 through !model 15 for other listed green models. Use !model auto to restore automatic OpenRouter → Groq → Mistral → verified-free Pollinations routing. Provider-chain models aren't selected with !model. Image requests stay on the explicitly configured vision-capable models.",
         message.id);
       return;
     }
     if (arg === "auto") {
       await setSetting(env.DB, "owner_selected_model_id", "");
       await sendUserReply(env, message, "Model override cleared. CONVY is back to AUTO routing in your preferred order.", message.id);
+      return;
+    }
+    const compactModelName = value => String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const providerModelChoices = [
+      { provider: "OpenRouter", modelId: configuredOpenRouterModel(env), aliases: ["LFM", "LFM 2.5B", "Liquid LFM 2.5 2.6B"] },
+      ...configuredGroqFallbackModels(env).map(item => ({
+        provider: "Groq",
+        modelId: item.modelId,
+        aliases: [
+          item.modelId.toLowerCase().includes("qwen") ? "Qwen 3.8 27B" : "",
+          item.modelId.toLowerCase().includes("gpt-oss-120b") ? "GPT-OSS 120B" : "",
+          item.modelId.toLowerCase().includes("gpt-oss-20b") ? "GPT-OSS 20B" : ""
+        ].filter(Boolean)
+      })),
+      { provider: "Mistral", modelId: configuredMistralModel(env), aliases: ["Ministral 14B", "Mistral Ministral 14B"] }
+    ];
+    const selectedProviderModel = providerModelChoices.find(item =>
+      [item.modelId, item.modelId.split("/").pop(), ...item.aliases]
+        .some(alias => compactModelName(alias) === compactModelName(arg))
+    );
+    if (selectedProviderModel) {
+      await sendUserReply(env, message,
+        "`" + selectedProviderModel.modelId + "` is a " + selectedProviderModel.provider +
+        " model in the **automatic provider chain**, not a Pollinations catalog selection. " +
+        "The chain already tries it at its configured position when earlier providers fail. " +
+        "Use `!model auto` to clear a manual override, or `!model 1` through `!model 15` to select a currently verified Pollinations community model.",
+        message.id);
+      return;
+    }
+    if (!/^\d+$/.test(arg) && /\s/.test(arg)) {
+      await sendUserReply(env, message,
+        "I couldn't match that display name to the automatic provider chain. `!model` only selects verified Pollinations catalog entries: use `!model 1` through `!model 15`, an exact Pollinations model ID, or `!model auto` to reset.",
+        message.id);
       return;
     }
     let catalog;
@@ -3724,7 +3816,7 @@ async function handleMention(env, message) {
       message.id);
     return;
   }
-  if (command === "!provider") {
+  if (command === "!provider" || command === "!providers") {
     if (!(await isAdmin(env, message))) {
       await sendUserReply(env, message, "Nope. !provider is admin-only.", message.id);
       return;
