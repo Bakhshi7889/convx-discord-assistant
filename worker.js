@@ -2851,7 +2851,7 @@ async function callFreeModel(env, db, messages, maxTokens = 550) {
         model: primaryId,
         detail: detail.slice(0, 1000)
       }));
-      throw new Error("No available free/fallback text model is responding right now. Please retry shortly.");
+      throw new Error("No configured text provider is responding right now. Please retry shortly.");
     }
   }
 
