@@ -49,7 +49,7 @@ Add these optional API keys as Cloudflare Worker secrets to enable the providers
 
 Model IDs are configurable through `GROQ_QWEN_MODEL`, `GROQ_GPT_OSS_120B_MODEL`, `GROQ_GPT_OSS_20B_MODEL`, and `MISTRAL_MODEL` Worker variables. Qwen is sent `reasoning_effort: none` by default; GPT-OSS models are sent `reasoning_effort: low` by default. A valid persistent creator setting from `!reasoning low|medium|high` overrides those Groq defaults. The bot never logs or exposes API key values.
 
-**Billing note:** Groq model endpoints can have per-model rate limits. Mistral's `ministral-14b-2512` is a metered model, so usage may consume your included monthly API allowance; the code cannot inspect your remaining allowance. Only configure `MISTRAL_API_KEY` when you are comfortable with that allowance being used, and leave Pay-as-you-go disabled if avoiding out-of-pocket charges is essential. Missing keys simply skip that provider.
+**Billing note:** The Worker cannot inspect your provider account's billing mode or remaining free allowance. Use Groq's free/developer access if you want to avoid charges. Mistral's `ministral-14b-2512` is a metered model, so usage may consume your included monthly API allowance; the code cannot inspect your remaining allowance. Only configure `MISTRAL_API_KEY` when you are comfortable with that allowance being used, and leave Pay-as-you-go disabled if avoiding out-of-pocket charges is essential. Missing keys simply skip that provider.
 
 ### Pollinations free fallbacks
 
