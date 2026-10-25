@@ -54,7 +54,8 @@ const CONVY_BUILD_VERSION = "convx-2026-10-25-r41";
 const CONVY_CURRENT_RELEASE_NOTES = [
   "Add Groq fallback models in order: Qwen 3.8 27B with reasoning disabled, GPT-OSS 120B with low reasoning, then GPT-OSS 20B with low reasoning.",
   "Add Ministral 14B as the next configurable Mistral fallback when MISTRAL_API_KEY is configured; retain Pollinations as the strict verified-free last resort.",
-  "Preserve the OpenRouter free-price verification, explicit model overrides, image routing, conversation memory, queues, diagnostics, and GitHub issue workflows."
+  "Keep OpenRouter pinned to the single configured LFM model; on failure, skip all other OpenRouter models and proceed to Groq, Mistral, then verified-free Pollinations.",
+  "Preserve explicit model overrides, image routing, conversation memory, queues, diagnostics, and GitHub issue workflows."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -1913,7 +1914,7 @@ function withRuntimeSnapshot(env, messages, modelId, settings, hasImages, tuning
     "Owner-selected model override: " + (ownerSelectedId || "AUTO (preferred order)"),
     "Configured primary provider: " + String(env.PRIMARY_MODEL_PROVIDER || DEFAULT_PRIMARY_MODEL_PROVIDER),
     "Configured OpenRouter model: " + String(env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL),
-    "Provider fallback order: OpenRouter verified-free primary and alternatives -> Groq Qwen 3.8 27B (reasoning none) -> Groq GPT-OSS 120B (reasoning low) -> Groq GPT-OSS 20B (reasoning low) -> Mistral Ministral 14B -> Pollinations verified-free last resort.",
+    "Provider fallback order: OpenRouter LFM only -> Groq Qwen 3.8 27B (reasoning none) -> Groq GPT-OSS 120B (reasoning low) -> Groq GPT-OSS 20B (reasoning low) -> Mistral Ministral 14B -> Pollinations verified-free last resort.",
     "Pollinations model order: " + PREFERRED_MODEL_ORDER.join(" -> "),
     "Images included in this request: " + (hasImages ? "yes" : "no"),
     "Response settings currently applied: " + JSON.stringify(settings),
@@ -2778,26 +2779,9 @@ async function callFreeModel(env, db, messages, maxTokens = 550) {
         return await callOpenRouterPrimary(env, db, messages, maxTokens);
       } catch (error) {
         primaryError = openRouterErrorDetail(error?.message || error);
-        console.log("OpenRouter primary failed; checking alternate verified-free models: " + primaryError);
+        console.log("OpenRouter LFM failed; skipping all other OpenRouter models and moving to external fallbacks: " + primaryError);
       }
-      try {
-        const candidates = await discoverOpenRouterFreeFallbacks(env, primaryId, 3);
-        for (const candidateId of candidates) {
-          try {
-            const alternate = await callOpenRouterPrimary(env, db, messages, maxTokens, candidateId);
-            return { ...alternate, fallbackFrom: "openrouter/" + primaryId };
-          } catch (error) {
-            const detail = openRouterErrorDetail(error?.message || error);
-            fallbackErrors.push("OpenRouter alternate " + candidateId + ": " + detail);
-            console.log("OpenRouter free fallback failed (" + candidateId + "): " + detail);
-          }
-        }
-        if (!candidates.length) console.log("OpenRouter catalog exposed no other verified-free text models.");
-      } catch (error) {
-        const detail = openRouterErrorDetail(error?.message || error);
-        fallbackErrors.push("OpenRouter alternate discovery: " + detail);
-        console.log("OpenRouter free fallback discovery failed: " + detail);
-      }
+      // Deliberately do not try any other OpenRouter model: keep the shared free quota for LFM only.
     }
 
     // Groq order is deliberate: inexpensive non-reasoning Qwen first, then low-effort GPT-OSS.
