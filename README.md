@@ -35,11 +35,21 @@ If duplicate searching fails, CONVY fails closed and does not create or comment 
 
 ### Primary: OpenRouter
 
-The default primary provider is OpenRouter with `liquid/lfm-2.5-2.6b:free`. Configure the model through `OPENROUTER_MODEL` and provider priority through `PRIMARY_MODEL_PROVIDER`; both are non-secret Worker variables in `wrangler.toml`. Before sending a request, the Worker verifies the configured model's ID, text modality, and explicit zero prompt/completion pricing against OpenRouter's model metadata. Successful checks are cached for 15 minutes in Durable Object storage, not D1. Model IDs that are not a `:free` variant or whose current prices cannot be confirmed as zero are rejected.
+The default primary provider is OpenRouter with `liquid/lfm-2.5-2.6b:free`. Configure the model through `OPENROUTER_MODEL` and provider priority through `PRIMARY_MODEL_PROVIDER`; both are non-secret Worker variables in `wrangler.toml`. Before sending a request, the Worker verifies the configured model's ID, text modality, and explicit zero prompt/completion pricing against OpenRouter's model metadata. Successful checks are cached for 15 minutes in Durable Object storage, not D1. Model IDs that are not a `:free` variant or whose current prices cannot be confirmed as zero are rejected. The automatic OpenRouter route intentionally attempts only the configured LFM model, never other OpenRouter models.
 
-Store the OpenRouter key only as the Cloudflare Worker secret `OPENROUTER_API_KEY`. Never put it in source code, `wrangler.toml`, GitHub commits, or chat. The code retries transient OpenRouter timeouts, rate limits, and provider errors once, then tries other OpenRouter models only after verifying their live text prices are zero. It then falls back to the existing Pollinations route. A missing OpenRouter key also causes the same safe fallback sequence. `/health` and `!provider` show secret presence and pricing-verification state without revealing key values. Explicit `!model 1-15` selections continue to use the existing Pollinations models; `!model auto` restores OpenRouter as the default text primary. The configured LFM model is text-only, so image requests continue to the explicit Pollinations vision-capable set.
+Store the OpenRouter key only as the Cloudflare Worker secret `OPENROUTER_API_KEY`. Never put it in source code, `wrangler.toml`, GitHub commits, or chat. The code retries transient OpenRouter timeouts, rate limits, and provider errors once, but it never tries a second OpenRouter model. It uses only the configured `liquid/lfm-2.5-2.6b:free` model on OpenRouter; if LFM fails or the OpenRouter key is missing, automatic text requests proceed directly to the ordered Groq fallback models: `qwen/qwen3.8-27b` with `reasoning_effort: none`, `openai/gpt-oss-120b` with `reasoning_effort: low`, and `openai/gpt-oss-20b` with `reasoning_effort: low`. The configured Mistral model (`ministral-14b-2512` by default) comes next when `MISTRAL_API_KEY` is configured. Pollinations is last and still requires the live catalog to verify explicit zero input/output text-token prices. Groq fallback calls use their OpenAI-compatible API. They fail forward on errors and rate limits rather than waiting through a long retry. `/health` and `!provider` show secret presence and pricing-verification state without revealing key values. Explicit `!model 1-15` selections continue to use the existing Pollinations models; `!model auto` restores OpenRouter as the default text primary. The configured LFM model is text-only, so image requests continue to the explicit Pollinations vision-capable set.
 
 **Privacy note:** OpenRouter's listing for this Liquid model says prompts and outputs may be retained and used to train Liquid models. CONVY sends its system instructions and relevant conversation context to the provider. Do not route secrets or sensitive personal/private information through this model.
+
+### Groq and Mistral fallbacks
+
+Add these optional API keys as Cloudflare Worker secrets to enable the providers:
+- `GROQ_API_KEY`: enables the ordered Groq fallback models listed above. If a model is unavailable or rate-limited, CONVY tries the next Groq model before moving to Mistral.
+- `MISTRAL_API_KEY`: enables `MISTRAL_MODEL` after Groq fails. The default is `ministral-14b-2512`.
+
+Model IDs are configurable through `GROQ_QWEN_MODEL`, `GROQ_GPT_OSS_120B_MODEL`, `GROQ_GPT_OSS_20B_MODEL`, and `MISTRAL_MODEL` Worker variables. Qwen is sent `reasoning_effort: none` by default; GPT-OSS models are sent `reasoning_effort: low` by default. A valid persistent creator setting from `!reasoning low|medium|high` overrides those Groq defaults. The bot never logs or exposes API key values.
+
+**Billing note:** The Worker cannot inspect your provider account's billing mode or remaining free allowance. Use Groq's free/developer access if you want to avoid charges. Mistral's `ministral-14b-2512` is a metered model, so usage may consume your included monthly API allowance; the code cannot inspect your remaining allowance. Only configure `MISTRAL_API_KEY` when you are comfortable with that allowance being used, and leave Pay-as-you-go disabled if avoiding out-of-pocket charges is essential. Missing keys simply skip that provider.
 
 ### Pollinations free fallbacks
 
@@ -52,7 +62,7 @@ Create a server-side key at https://enter.pollinations.ai/keys and store it only
 4. `community/YoannDev90/muse-glimmer-30b:free` (Muse Glimmer 30B)
 5. `community/chirag-gamer/gpt-oss-120b` (GPT OSS 120B)
 
-All five still must pass the live free-community catalog and pricing checks before they can be used. Up to ten other healthy/green eligible models can appear as alternatives at `!model 6` through `!model 15`. Model selection is creator-only; `!model auto` restores automatic routing. Image requests use only the explicit vision-capable set (Gemma Diffusion 26B and Muse Glimmer 30B), never a text-only model just because it ranks highly. Long Discord replies are split rather than silently truncated. No paid fallback is attempted if the free stack fails.
+All five still must pass the live free-community catalog and pricing checks before they can be used. Up to ten other healthy/green eligible models can appear as alternatives at `!model 6` through `!model 15`. Model selection is creator-only; `!model auto` restores automatic routing. Image requests use only the explicit vision-capable set (Gemma Diffusion 26B and Muse Glimmer 30B), never a text-only model just because it ranks highly. Long Discord replies are split rather than silently truncated. Pollinations itself remains strictly zero-price verified. Groq/Mistral fallbacks are attempted only when their corresponding Worker API keys are configured; see the billing note above, especially for Mistral's metered API usage.
 
 ## Cloudflare
 
@@ -62,11 +72,17 @@ Database ID: `9da42b8b-4129-40bf-b19a-d76acb7ee801`
 The deployed Worker is `convx-discord-assistant`. Required Worker secrets:
 - `DISCORD_TOKEN`
 - `POLLINATIONS_API_KEY`
-- `OPENROUTER_API_KEY` (required for the OpenRouter primary; without it the Worker continues through configured zero-cost fallbacks)
+- `OPENROUTER_API_KEY` (required for the OpenRouter primary; without it the Worker continues through the configured fallback chain)
+- `GROQ_API_KEY` (optional; enables the three-model Groq fallback chain)
+- `MISTRAL_API_KEY` (optional; enables the Mistral fallback after Groq; usage may consume included monthly API allowance)
 
 Worker variables:
 - `PRIMARY_MODEL_PROVIDER` (`openrouter` by default; can be set to `pollinations`)
 - `OPENROUTER_MODEL` (defaults to `liquid/lfm-2.5-2.6b:free`; use only verified free IDs)
+- `GROQ_QWEN_MODEL` (defaults to `qwen/qwen3.8-27b`)
+- `GROQ_GPT_OSS_120B_MODEL` (defaults to `openai/gpt-oss-120b`)
+- `GROQ_GPT_OSS_20B_MODEL` (defaults to `openai/gpt-oss-20b`)
+- `MISTRAL_MODEL` (defaults to `ministral-14b-2512`)
 - `TARGET_CHANNEL_ID`
 - `BOT_USER_ID`
 - `GUILD_ID`

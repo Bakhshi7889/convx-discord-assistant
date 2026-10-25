@@ -3,6 +3,8 @@ import { DurableObject } from "cloudflare:workers";
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
 const OPENROUTER_API = "https://openrouter.ai/api/v1";
+const GROQ_API = "https://api.groq.com/openai/v1";
+const MISTRAL_API = "https://api.mistral.ai/v1";
 const CONVY_ISSUES_REPOSITORY = "cosmictaserdev-creator/Convx";
 const ISSUE_DRAFT_TTL_MS = 10 * 60 * 1000;
 const ISSUE_CREATE_RATE_LIMIT = 2;
@@ -13,6 +15,11 @@ const ISSUE_COMMENT_RATE_LIMIT = 4;
 const ISSUE_COMMENT_GLOBAL_LIMIT = 20;
 const DEFAULT_PRIMARY_MODEL_PROVIDER = "openrouter";
 const DEFAULT_OPENROUTER_MODEL = "liquid/lfm-2.5-2.6b:free";
+const DEFAULT_GROQ_QWEN_MODEL = "qwen/qwen3.8-27b";
+const DEFAULT_GROQ_GPT_OSS_120B_MODEL = "openai/gpt-oss-120b";
+const DEFAULT_GROQ_GPT_OSS_20B_MODEL = "openai/gpt-oss-20b";
+const DEFAULT_MISTRAL_MODEL = "ministral-14b-2512";
+const PROVIDER_FALLBACK_TIMEOUT_MS = 18000;
 const OPENROUTER_MODEL_CHECK_CACHE_MS = 15 * 60 * 1000;
 const OPENROUTER_REQUEST_TIMEOUT_MS = 30000;
 // Lazy-refresh the shared Pollinations catalog hourly in Durable Object storage, never D1.
@@ -43,11 +50,12 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-25-r40";
+const CONVY_BUILD_VERSION = "convx-2026-10-25-r41";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Remove the unused third-party gateway route and pricing cache; keep the existing OpenRouter-first and Pollinations fallback chain.",
-  "Preserve strict zero-price verification for existing inference routes and avoid creating additional provider credentials or billing dependencies.",
-  "Keep conversation memory, queueing, diagnostics, model commands, and GitHub issue workflows unchanged."
+  "Add Groq fallback models in order: Qwen 3.8 27B with reasoning disabled, GPT-OSS 120B with low reasoning, then GPT-OSS 20B with low reasoning.",
+  "Add Ministral 14B as the next configurable Mistral fallback when MISTRAL_API_KEY is configured; retain Pollinations as the strict verified-free last resort.",
+  "Keep OpenRouter pinned to the single configured LFM model; on failure, skip all other OpenRouter models and proceed to Groq, Mistral, then verified-free Pollinations.",
+  "Preserve explicit model overrides, image routing, conversation memory, queues, diagnostics, and GitHub issue workflows."
 ];
 const CONVY_RELEASE_HISTORY = [
   {
@@ -1906,11 +1914,14 @@ function withRuntimeSnapshot(env, messages, modelId, settings, hasImages, tuning
     "Owner-selected model override: " + (ownerSelectedId || "AUTO (preferred order)"),
     "Configured primary provider: " + String(env.PRIMARY_MODEL_PROVIDER || DEFAULT_PRIMARY_MODEL_PROVIDER),
     "Configured OpenRouter model: " + String(env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL),
-    "Pollinations fallback order: " + PREFERRED_MODEL_ORDER.join(" -> "),
+    "Provider fallback order: OpenRouter LFM only -> Groq Qwen 3.8 27B (reasoning none) -> Groq GPT-OSS 120B (reasoning low) -> Groq GPT-OSS 20B (reasoning low) -> Mistral Ministral 14B -> Pollinations verified-free last resort.",
+    "Pollinations model order: " + PREFERRED_MODEL_ORDER.join(" -> "),
     "Images included in this request: " + (hasImages ? "yes" : "no"),
     "Response settings currently applied: " + JSON.stringify(settings),
     "Per-reply setting adjustment tool available: " + (tuningEnabled ? "yes, adjust_response_settings" : "no"),
-    "The setting tool can only change reasoning_effort, temperature, and max_tokens for this reply. It cannot change the active model, access external tools, write database settings, or persist preferences.",
+    tuningEnabled
+      ? "The setting tool can only change reasoning_effort, temperature, and max_tokens for this reply. It cannot change the active model, access external tools, write database settings, or persist preferences."
+      : "This provider fallback does not expose the per-reply response-settings tool.",
     "Known changes in this build:\n- " + CONVY_RELEASE_NOTES.join("\n- ")
   ].join("\n");
   return (messages || []).map((message, index) => {
@@ -2599,6 +2610,154 @@ async function callOpenRouterPrimary(env, db, messages, maxTokens = 550, modelId
   }
 }
 
+function configuredGroqFallbackModels(env) {
+  const configured = [
+    { modelId: String(env.GROQ_QWEN_MODEL || DEFAULT_GROQ_QWEN_MODEL).trim(), defaultReasoning: "none" },
+    { modelId: String(env.GROQ_GPT_OSS_120B_MODEL || DEFAULT_GROQ_GPT_OSS_120B_MODEL).trim(), defaultReasoning: "low" },
+    { modelId: String(env.GROQ_GPT_OSS_20B_MODEL || DEFAULT_GROQ_GPT_OSS_20B_MODEL).trim(), defaultReasoning: "low" }
+  ];
+  const seen = new Set();
+  return configured.filter(item => {
+    if (!item.modelId || seen.has(item.modelId)) return false;
+    seen.add(item.modelId);
+    return true;
+  });
+}
+
+function configuredMistralModel(env) {
+  return String(env.MISTRAL_MODEL || DEFAULT_MISTRAL_MODEL).trim();
+}
+
+async function callCompatibleFallback(env, db, messages, maxTokens, provider, modelId, defaultReasoning) {
+  if (provider !== "groq" && provider !== "mistral") throw new Error("Unsupported fallback provider.");
+  const apiKey = provider === "groq" ? env.GROQ_API_KEY : env.MISTRAL_API_KEY;
+  if (!apiKey) throw new Error(provider.toUpperCase() + "_API_KEY is not configured in the Cloudflare Worker.");
+  if (messages.some(message => Array.isArray(message.content) && message.content.some(part => part?.type === "image_url"))) {
+    throw new Error(provider + " fallback is text-only; image requests remain on the Pollinations vision route.");
+  }
+
+  const started = Date.now();
+  const metricId = provider + "/" + modelId;
+  let recorded = false;
+  try {
+    const ownerSelectedId = await setting(db, "owner_selected_model_id");
+    const configuredReasoning = String(await setting(db, "reasoning_override") || "").trim().toLowerCase();
+    const configuredTemperature = await setting(db, "temperature_override");
+    const configuredMaxTokens = await setting(db, "max_tokens_override");
+    const defaults = initialResponseSettings(requestText(messages), maxTokens, false);
+    const temperature = configuredTemperature !== null && configuredTemperature !== "" &&
+      Number.isFinite(Number(configuredTemperature)) && Number(configuredTemperature) >= 0 && Number(configuredTemperature) <= 1
+      ? Number(configuredTemperature)
+      : defaults.temperature;
+    const outputTokens = configuredMaxTokens !== null && configuredMaxTokens !== "" &&
+      Number.isInteger(Number(configuredMaxTokens)) && Number(configuredMaxTokens) >= 100 && Number(configuredMaxTokens) <= 900
+      ? Number(configuredMaxTokens)
+      : defaults.max_tokens;
+    const reasoningEffort = provider === "groq"
+      ? (["low", "medium", "high"].includes(configuredReasoning) ? configuredReasoning : defaultReasoning)
+      : "";
+    const runtimeSettings = {
+      temperature,
+      max_tokens: outputTokens,
+      reasoning_effort: reasoningEffort || defaults.reasoning_effort
+    };
+    const requestMessages = withRuntimeSnapshot(
+      env, messages, metricId, runtimeSettings, false, false, ownerSelectedId
+    );
+    const body = {
+      model: modelId,
+      messages: requestMessages,
+      temperature,
+      ...(provider === "groq"
+        ? { max_completion_tokens: outputTokens, reasoning_effort: reasoningEffort }
+        : { max_tokens: outputTokens })
+    };
+    // Keep GPT-OSS reasoning out of the returned message while using its low-effort mode.
+    if (provider === "groq" && modelId.toLowerCase().startsWith("openai/gpt-oss-")) {
+      body.include_reasoning = false;
+    }
+
+    const baseUrl = provider === "groq" ? GROQ_API : MISTRAL_API;
+    const response = await fetch(baseUrl + "/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + apiKey,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(PROVIDER_FALLBACK_TIMEOUT_MS)
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      const failure = new Error(provider + " returned unreadable JSON (HTTP " + response.status + ").");
+      failure.status = response.status;
+      throw failure;
+    }
+    if (!response.ok || payload?.error) {
+      const detail = payload?.error?.message || payload?.message || "";
+      const status = Number(response.status) || Number(payload?.error?.code) || 502;
+      const failure = new Error(provider + " returned HTTP " + status + (detail ? ": " + openRouterErrorDetail(detail) : "."));
+      failure.status = status;
+      throw failure;
+    }
+
+    const assistantMessage = payload?.choices?.[0]?.message;
+    const rawAnswer = assistantMessage?.content;
+    const answer = typeof rawAnswer === "string"
+      ? rawAnswer.trim()
+      : Array.isArray(rawAnswer)
+        ? rawAnswer.filter(part => part?.type === "text" && part.text).map(part => String(part.text)).join("").trim()
+        : "";
+    if (!answer) {
+      const failure = new Error(provider + " returned an empty answer for model " + modelId + ".");
+      failure.status = 502;
+      throw failure;
+    }
+
+    const elapsed = Date.now() - started;
+    await recordModelResult(env, metricId, elapsed, true);
+    recorded = true;
+    const usage = openRouterUsage(payload);
+    console.log(JSON.stringify({
+      event: "model_request",
+      provider,
+      model: modelId,
+      outcome: "success",
+      latency_ms: elapsed,
+      prompt_tokens: usage.promptTokens,
+      completion_tokens: usage.completionTokens,
+      total_tokens: usage.totalTokens,
+      reasoning_effort: reasoningEffort || null
+    }));
+    return {
+      content: answer,
+      modelId,
+      provider,
+      usage,
+      settings: runtimeSettings,
+      buildVersion: CONVY_BUILD_VERSION
+    };
+  } catch (error) {
+    if (!recorded) {
+      try { await recordModelResult(env, metricId, Date.now() - started, false); } catch {}
+    }
+    console.log(JSON.stringify({
+      event: "model_request",
+      provider,
+      model: modelId,
+      outcome: "failure",
+      latency_ms: Date.now() - started,
+      http_status: Number(error?.status) || null,
+      error: openRouterErrorDetail(error?.message || error)
+    }));
+    throw error;
+  }
+}
+
 async function callFreeModel(env, db, messages, maxTokens = 550) {
   const provider = configuredPrimaryProvider(env);
   const selectedOverride = await setting(db, "owner_selected_model_id");
@@ -2606,12 +2765,12 @@ async function callFreeModel(env, db, messages, maxTokens = 550) {
     Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
   );
 
-  // Text requests prefer LFM. If it is temporarily unavailable, try discovered
-  // OpenRouter :free alternatives; each alternate is verified before inference.
-  // Explicit !model selections and image requests keep using their existing Pollinations route.
+  // Manual model choices and image requests retain their existing Pollinations route.
   if (provider === "openrouter" && !selectedOverride && !hasImages) {
     const primaryId = configuredOpenRouterModel(env);
     let primaryError = "";
+    const fallbackErrors = [];
+
     if (!env.OPENROUTER_API_KEY) {
       primaryError = "OPENROUTER_API_KEY is missing";
       console.log("OpenRouter primary unavailable: " + primaryError);
@@ -2620,37 +2779,68 @@ async function callFreeModel(env, db, messages, maxTokens = 550) {
         return await callOpenRouterPrimary(env, db, messages, maxTokens);
       } catch (error) {
         primaryError = openRouterErrorDetail(error?.message || error);
-        console.log("OpenRouter primary failed; checking alternate verified-free models: " + primaryError);
+        console.log("OpenRouter LFM failed; skipping all other OpenRouter models and moving to external fallbacks: " + primaryError);
       }
-      try {
-        const candidates = await discoverOpenRouterFreeFallbacks(env, primaryId, 3);
-        for (const candidateId of candidates) {
-          try {
-            const alternate = await callOpenRouterPrimary(env, db, messages, maxTokens, candidateId);
-            return { ...alternate, fallbackFrom: "openrouter/" + primaryId };
-          } catch (error) {
-            console.log("OpenRouter free fallback failed (" + candidateId + "): " + openRouterErrorDetail(error?.message || error));
-          }
-        }
-        if (!candidates.length) console.log("OpenRouter catalog exposed no other verified-free text models.");
-      } catch (error) {
-        console.log("OpenRouter free fallback discovery failed: " + openRouterErrorDetail(error?.message || error));
-      }
+      // Deliberately do not try any other OpenRouter model: keep the shared free quota for LFM only.
     }
+
+    // Groq order is deliberate: inexpensive non-reasoning Qwen first, then low-effort GPT-OSS.
+    if (env.GROQ_API_KEY) {
+      for (const item of configuredGroqFallbackModels(env)) {
+        try {
+          const fallback = await callCompatibleFallback(
+            env, db, messages, maxTokens, "groq", item.modelId, item.defaultReasoning
+          );
+          return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
+        } catch (error) {
+          const detail = openRouterErrorDetail(error?.message || error);
+          fallbackErrors.push("Groq " + item.modelId + ": " + detail);
+          console.log("Groq fallback failed (" + item.modelId + "): " + detail);
+        }
+      }
+    } else {
+      fallbackErrors.push("Groq: GROQ_API_KEY is not configured");
+      console.log("Groq fallbacks skipped: GROQ_API_KEY is not configured.");
+    }
+
+    // Mistral is intentionally after all Groq candidates; it is attempted only when its key exists.
+    if (env.MISTRAL_API_KEY) {
+      const mistralModel = configuredMistralModel(env);
+      try {
+        const fallback = await callCompatibleFallback(
+          env, db, messages, maxTokens, "mistral", mistralModel, ""
+        );
+        return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
+      } catch (error) {
+        const detail = openRouterErrorDetail(error?.message || error);
+        fallbackErrors.push("Mistral " + mistralModel + ": " + detail);
+        console.log("Mistral fallback failed (" + mistralModel + "): " + detail);
+      }
+    } else {
+      fallbackErrors.push("Mistral: MISTRAL_API_KEY is not configured");
+      console.log("Mistral fallback skipped: MISTRAL_API_KEY is not configured.");
+    }
+
     try {
       const fallback = await callPollinationsModel(env, db, messages, maxTokens);
       return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
     } catch (error) {
-      const fallbackError = openRouterErrorDetail(error?.message || error);
+      const pollinationsError = openRouterErrorDetail(error?.message || error);
+      fallbackErrors.push("Pollinations: " + pollinationsError);
       const detail = "Primary " + primaryId + ": " + (primaryError || "unavailable") +
-        "; Pollinations fallback: " + (fallbackError || "unavailable");
-      console.log(JSON.stringify({ event: "model_stack_failure", provider: "openrouter", model: primaryId, detail: detail.slice(0, 800) }));
-      throw new Error("No verified free text model is available right now. Please retry shortly.");
+        "; " + fallbackErrors.join("; ");
+      console.log(JSON.stringify({
+        event: "model_stack_failure",
+        provider: "openrouter",
+        model: primaryId,
+        detail: detail.slice(0, 1000)
+      }));
+      throw new Error("No configured text provider is responding right now. Please retry shortly.");
     }
   }
 
   if (provider !== "openrouter" && provider !== "pollinations") {
-    console.log("Unknown PRIMARY_MODEL_PROVIDER value; using the existing Pollinations fallback. provider=" + provider.slice(0, 40));
+    console.log("Unknown PRIMARY_MODEL_PROVIDER value; using the existing Pollinations route. provider=" + provider.slice(0, 40));
   }
   return callPollinationsModel(env, db, messages, maxTokens);
 }
@@ -3543,6 +3733,11 @@ async function handleMention(env, message) {
       "Primary provider env: " + provider + "\n" +
       "Configured OpenRouter model: " + modelId + "\n" +
       "OpenRouter key present: " + (hasKey ? "yes (value hidden)" : "NO") + "\n" +
+      "Groq key present: " + (Boolean(env.GROQ_API_KEY) ? "yes (value hidden)" : "no") + "\n" +
+      "Groq models: " + configuredGroqFallbackModels(env).map(item => item.modelId).join(" -> ") + "\n" +
+      "Mistral key present: " + (Boolean(env.MISTRAL_API_KEY) ? "yes (value hidden)" : "no") + "\n" +
+      "Mistral model: " + configuredMistralModel(env) + "\n" +
+      "Fallback order: verified-free OpenRouter -> Groq models -> Mistral (if configured) -> verified-free Pollinations\n" +
       "Cached free-price verification: " + statusText + "\n" +
       "Manual model override: " + (selected || "none, automatic primary routing") + "\n" +
       "Routing note: explicit model overrides use Pollinations; image requests currently use Pollinations vision models. Check Worker logs for the exact provider/model event.",
@@ -4647,8 +4842,12 @@ export default {
           discordToken: Boolean(env.DISCORD_TOKEN),
           pollinationsKey: Boolean(env.POLLINATIONS_API_KEY),
           openRouterKey: Boolean(env.OPENROUTER_API_KEY),
+          groqKey: Boolean(env.GROQ_API_KEY),
+          mistralKey: Boolean(env.MISTRAL_API_KEY),
           primaryModelProvider: configuredPrimaryProvider(env),
           openRouterModel: configuredOpenRouterModel(env),
+          groqModels: configuredGroqFallbackModels(env).map(item => item.modelId),
+          mistralModel: configuredMistralModel(env),
           channelId: Boolean(env.TARGET_CHANNEL_ID),
           botUserId: Boolean(env.BOT_USER_ID),
           guildId: Boolean(env.GUILD_ID),
