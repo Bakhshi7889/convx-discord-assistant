@@ -43,6 +43,8 @@ const VISION_MODEL_IDS = new Set([
   "community/scriptsnsenses-sys/diffusiongema-26B-free",
   "community/YoannDev90/muse-glimmer-30b:free"
 ]);
+// Groq docs list this configured Qwen model as accepting text and image inputs.
+const GROQ_VISION_MODEL_IDS = new Set(["qwen/qwen3.8-27b"]);
 // Keep tool-setting support explicit and independent of preferred rank.
 const SETTINGS_CAPABLE_MODEL_IDS = new Set([
   "community/YoannDev90/muse-glimmer-30b:free",
@@ -50,8 +52,13 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-25-r43";
+const CONVY_BUILD_VERSION = "convx-2026-10-26-r44";
 const CONVY_CURRENT_RELEASE_NOTES = [
+  "Fix nested Gateway self-calls from inside the Durable Object by dispatching control routes directly, preventing the observed D1 subrequest-depth failure during replies.",
+  "Add an opt-in Groq Qwen 3.8 27B vision fallback for image requests; it stays disabled by default to avoid unexpected metered inference charges.",
+  "Automatically inspect a member's own public Discord avatar/banner when they ask how their PFP looks.",
+  "Save the latest provider failure separately from chat history and return it for creator requests such as 'Give exact error' or !last-error.",
+  "Let inference continue with safe defaults when a nonessential D1 settings read fails.",
   "Guard identity-question replies against impersonating known members or falsely assigning developer/owner roles; route corrections to the verified creator identity.",
   "Explain when !model is given an automatic OpenRouter/Groq/Mistral provider model instead of a Pollinations catalog choice; support !providers as an alias for !provider.",
   "Ground recent channel history in Discord author IDs and add stricter rules against impersonating members or inventing ownership/developer claims.",
@@ -135,6 +142,10 @@ const CONVY_RELEASE_HISTORY = [
   }
 ];
 const CONVY_RELEASE_NOTES = [
+  "Fix nested Gateway self-calls in the Durable Object that can trigger D1 subrequest-depth errors during inference.",
+  "Add opt-in Groq Qwen 3.8 27B vision routing, but require explicit GROQ_VISION_ENABLED=true because provider inference may be metered; inspect a user's own Discord avatar for natural PFP questions.",
+  "Persist the latest provider failure and answer exact-error requests from live diagnostics rather than old chat history.",
+  "Use safe defaults for nonessential settings reads so temporary D1 errors do not automatically abort model routing.",
   "Add a last-resort correction for identity questions when the generated reply impersonates a member or attributes an unverified developer/owner role.",
   "Clarify that !model changes Pollinations overrides, while OpenRouter/Groq/Mistral are part of automatic provider routing; accept !providers as a diagnostic alias.",
   "Ground speaker history in Discord user IDs and strengthen identity/ownership anti-hallucination rules.",
@@ -183,6 +194,14 @@ function json(data, status = 200) {
 }
 function setting(db, key) {
   return db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first().then(row => row?.value ?? null);
+}
+async function safeSetting(db, key, fallback = null) {
+  try { return await setting(db, key); }
+  catch (error) {
+    console.log("D1 setting read skipped; using safe default for " + String(key || "").slice(0, 60) + ": " +
+      String(error?.message || error).replace(/[\r\n]+/g, " ").slice(0, 160));
+    return fallback;
+  }
 }
 async function setSetting(db, key, value) {
   await db.prepare(
@@ -240,9 +259,16 @@ function isCreator(message) {
   return String(message?.author?.id || "") === CONVY_CREATOR_USER_ID;
 }
 async function gatewayControl(env, path, options = {}) {
-  if (!env.DISCORD_GATEWAY) throw new Error("The Gateway control store is unavailable.");
-  const id = env.DISCORD_GATEWAY.idFromName("convx-discord-gateway");
-  const response = await env.DISCORD_GATEWAY.get(id).fetch("https://gateway" + path, options);
+  const directInstance = env?.__CONVY_GATEWAY_INSTANCE;
+  let response;
+  if (directInstance && typeof directInstance.fetch === "function") {
+    // Avoid calling the same Durable Object through its binding from inside itself.
+    response = await directInstance.fetch(new Request("https://gateway" + path, options));
+  } else {
+    if (!env.DISCORD_GATEWAY) throw new Error("The Gateway control store is unavailable.");
+    const id = env.DISCORD_GATEWAY.idFromName("convx-discord-gateway");
+    response = await env.DISCORD_GATEWAY.get(id).fetch("https://gateway" + path, options);
+  }
   let body = {};
   try { body = await response.json(); } catch {}
   if (!response.ok || body.ok === false) throw new Error(String(body.error || ("Gateway control HTTP " + response.status)));
@@ -1958,9 +1984,9 @@ async function callPollinationsModel(env,db,messages,maxTokens=550) {
     throw new Error("Pollinations returned no eligible free community text models with no billed text-token rates. No paid model was attempted.");
   }
 
-  const configuredReasoning = await setting(db, "reasoning_override");
-  const configuredTemperature = await setting(db, "temperature_override");
-  const configuredMaxTokens = await setting(db, "max_tokens_override");
+  const configuredReasoning = await safeSetting(db, "reasoning_override");
+  const configuredTemperature = await safeSetting(db, "temperature_override");
+  const configuredMaxTokens = await safeSetting(db, "max_tokens_override");
   const lockedSettings = {};
   if (["low", "medium", "high"].includes(String(configuredReasoning || ""))) lockedSettings.reasoning_effort = String(configuredReasoning);
   if (configuredTemperature !== null && configuredTemperature !== "" && Number.isFinite(Number(configuredTemperature)) && Number(configuredTemperature) >= 0 && Number(configuredTemperature) <= 1) lockedSettings.temperature = Number(configuredTemperature);
@@ -1972,7 +1998,7 @@ async function callPollinationsModel(env,db,messages,maxTokens=550) {
   const pinnedOrder = hasImages
     ? PREFERRED_MODEL_ORDER.filter(id => VISION_MODEL_IDS.has(id))
     : PREFERRED_MODEL_ORDER;
-  const ownerSelectedId = await setting(db, "owner_selected_model_id");
+  const ownerSelectedId = await safeSetting(db, "owner_selected_model_id", "");
   const routingOrder = [
     ...(ownerSelectedId && (!hasImages || VISION_MODEL_IDS.has(ownerSelectedId)) ? [ownerSelectedId] : []),
     ...pinnedOrder
@@ -2332,6 +2358,29 @@ function retryAfterDelayMs(value, now = Date.now()) {
 function openRouterErrorDetail(value) {
   return String(value || "").replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").slice(0, 170);
 }
+function safeProviderDiagnostic(value, maxLength = 1800) {
+  return String(value || "")
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk-or-v1-|sk-|gsk_|pplx-|nvapi-|cfut_)[A-Za-z0-9_-]{8,}\b/gi, "[redacted]")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .slice(0, Math.max(100, Math.min(2400, Number(maxLength) || 1800)));
+}
+async function saveLatestModelFailure(env, detail, source = "inference") {
+  try {
+    await gatewayControl(env, "/models/last-error", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        at: Date.now(),
+        source: String(source || "inference").slice(0, 80),
+        detail: safeProviderDiagnostic(detail, 1800)
+      })
+    });
+  } catch (error) {
+    console.log("Latest model failure snapshot write skipped: " + String(error?.message || error).slice(0, 120));
+  }
+}
 
 function parseOpenRouterSSE(rawBody) {
   const rows = new Map();
@@ -2511,10 +2560,10 @@ async function callOpenRouterPrimary(env, db, messages, maxTokens = 550, modelId
   let recorded = false;
   try {
     const verification = await verifyOpenRouterFreeModel(env, modelId);
-    const ownerSelectedId = await setting(db, "owner_selected_model_id");
-    const configuredReasoning = await setting(db, "reasoning_override");
-    const configuredTemperature = await setting(db, "temperature_override");
-    const configuredMaxTokens = await setting(db, "max_tokens_override");
+    const ownerSelectedId = await safeSetting(db, "owner_selected_model_id", "");
+    const configuredReasoning = await safeSetting(db, "reasoning_override");
+    const configuredTemperature = await safeSetting(db, "temperature_override");
+    const configuredMaxTokens = await safeSetting(db, "max_tokens_override");
     const lockedSettings = {};
     if (["low", "medium", "high"].includes(String(configuredReasoning || ""))) lockedSettings.reasoning_effort = String(configuredReasoning);
     if (configuredTemperature !== null && configuredTemperature !== "" && Number.isFinite(Number(configuredTemperature)) && Number(configuredTemperature) >= 0 && Number(configuredTemperature) <= 1) lockedSettings.temperature = Number(configuredTemperature);
@@ -2646,19 +2695,22 @@ async function callCompatibleFallback(env, db, messages, maxTokens, provider, mo
   if (provider !== "groq" && provider !== "mistral") throw new Error("Unsupported fallback provider.");
   const apiKey = provider === "groq" ? env.GROQ_API_KEY : env.MISTRAL_API_KEY;
   if (!apiKey) throw new Error(provider.toUpperCase() + "_API_KEY is not configured in the Cloudflare Worker.");
-  if (messages.some(message => Array.isArray(message.content) && message.content.some(part => part?.type === "image_url"))) {
-    throw new Error(provider + " fallback is text-only; image requests remain on the Pollinations vision route.");
+  const hasImages = messages.some(message =>
+    Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
+  );
+  if (hasImages && !(provider === "groq" && GROQ_VISION_MODEL_IDS.has(modelId))) {
+    throw new Error(provider + " model " + modelId + " is not on the configured vision-capable allowlist.");
   }
 
   const started = Date.now();
   const metricId = provider + "/" + modelId;
   let recorded = false;
   try {
-    const ownerSelectedId = await setting(db, "owner_selected_model_id");
-    const configuredReasoning = String(await setting(db, "reasoning_override") || "").trim().toLowerCase();
-    const configuredTemperature = await setting(db, "temperature_override");
-    const configuredMaxTokens = await setting(db, "max_tokens_override");
-    const defaults = initialResponseSettings(requestText(messages), maxTokens, false);
+    const ownerSelectedId = await safeSetting(db, "owner_selected_model_id", "");
+    const configuredReasoning = String(await safeSetting(db, "reasoning_override", "") || "").trim().toLowerCase();
+    const configuredTemperature = await safeSetting(db, "temperature_override");
+    const configuredMaxTokens = await safeSetting(db, "max_tokens_override");
+    const defaults = initialResponseSettings(requestText(messages), maxTokens, hasImages);
     const temperature = configuredTemperature !== null && configuredTemperature !== "" &&
       Number.isFinite(Number(configuredTemperature)) && Number(configuredTemperature) >= 0 && Number(configuredTemperature) <= 1
       ? Number(configuredTemperature)
@@ -2676,7 +2728,7 @@ async function callCompatibleFallback(env, db, messages, maxTokens, provider, mo
       reasoning_effort: reasoningEffort || defaults.reasoning_effort
     };
     const requestMessages = withRuntimeSnapshot(
-      env, messages, metricId, runtimeSettings, false, false, ownerSelectedId
+      env, messages, metricId, runtimeSettings, hasImages, false, ownerSelectedId
     );
     const body = {
       model: modelId,
@@ -2774,91 +2826,128 @@ async function callCompatibleFallback(env, db, messages, maxTokens, provider, mo
 
 async function callFreeModel(env, db, messages, maxTokens = 550) {
   const provider = configuredPrimaryProvider(env);
-  const selectedOverride = await setting(db, "owner_selected_model_id");
+  const selectedOverride = String(await safeSetting(db, "owner_selected_model_id", "") || "").trim();
   const hasImages = messages.some(message =>
     Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
   );
 
-  // Manual model choices and image requests retain their existing Pollinations route.
-  if (provider === "openrouter" && !selectedOverride && !hasImages) {
+  // Use Groq Qwen for image requests when available, so Pollinations is not the single point of failure.
+  if (hasImages) {
+    const failures = [];
+    const preferPollinationsVision = Boolean(selectedOverride && VISION_MODEL_IDS.has(selectedOverride));
+    if (preferPollinationsVision) {
+      try { return await callPollinationsModel(env, db, messages, maxTokens); }
+      catch (error) { failures.push("Selected Pollinations vision route: " + safeProviderDiagnostic(error?.message || error, 240)); }
+    }
+    if (String(env.GROQ_VISION_ENABLED || "").trim().toLowerCase() === "true" && env.GROQ_API_KEY) {
+      for (const item of configuredGroqFallbackModels(env).filter(candidate => GROQ_VISION_MODEL_IDS.has(candidate.modelId))) {
+        try {
+          return await callCompatibleFallback(env, db, messages, maxTokens, "groq", item.modelId, item.defaultReasoning);
+        } catch (error) {
+          const detail = safeProviderDiagnostic(error?.message || error, 240);
+          failures.push("Groq vision " + item.modelId + ": " + detail);
+          console.log("Groq vision fallback failed (" + item.modelId + "): " + detail);
+        }
+      }
+    } else if (String(env.GROQ_VISION_ENABLED || "").trim().toLowerCase() !== "true") {
+      failures.push("Groq vision is disabled by default to avoid unexpected metered image inference; set GROQ_VISION_ENABLED=true to opt in.");
+    } else {
+      failures.push("Groq vision: GROQ_API_KEY is not configured");
+    }
+    if (!preferPollinationsVision) {
+      try { return await callPollinationsModel(env, db, messages, maxTokens); }
+      catch (error) { failures.push("Pollinations vision: " + safeProviderDiagnostic(error?.message || error, 240)); }
+    }
+    const detail = failures.join("; ") || "No configured vision-capable model was available.";
+    await saveLatestModelFailure(env, detail, "vision_inference");
+    const failure = new Error("I couldn't analyze that image right now. Please retry shortly.");
+    failure.diagnosticDetail = detail;
+    throw failure;
+  }
+
+  if (provider === "openrouter") {
     const primaryId = configuredOpenRouterModel(env);
     let primaryError = "";
     const fallbackErrors = [];
-
-    if (!env.OPENROUTER_API_KEY) {
+    if (selectedOverride) {
+      try { return await callPollinationsModel(env, db, messages, maxTokens); }
+      catch (error) {
+        primaryError = "Manual Pollinations override " + selectedOverride + " failed: " +
+          safeProviderDiagnostic(error?.message || error, 240);
+        fallbackErrors.push(primaryError);
+        console.log("Manual Pollinations override failed; falling through to automatic providers: " + primaryError);
+      }
+    } else if (!env.OPENROUTER_API_KEY) {
       primaryError = "OPENROUTER_API_KEY is missing";
       console.log("OpenRouter primary unavailable: " + primaryError);
     } else {
-      try {
-        return await callOpenRouterPrimary(env, db, messages, maxTokens);
-      } catch (error) {
-        primaryError = openRouterErrorDetail(error?.message || error);
-        console.log("OpenRouter LFM failed; skipping all other OpenRouter models and moving to external fallbacks: " + primaryError);
+      try { return await callOpenRouterPrimary(env, db, messages, maxTokens); }
+      catch (error) {
+        primaryError = safeProviderDiagnostic(error?.message || error, 240);
+        fallbackErrors.push("OpenRouter " + primaryId + ": " + primaryError);
+        console.log("OpenRouter LFM failed; moving to external fallbacks: " + primaryError);
       }
-      // Deliberately do not try any other OpenRouter model: keep the shared free quota for LFM only.
     }
 
-    // Groq order is deliberate: inexpensive non-reasoning Qwen first, then low-effort GPT-OSS.
+    // Always continue through the remaining providers if a single fallback hits a rate limit.
     if (env.GROQ_API_KEY) {
       for (const item of configuredGroqFallbackModels(env)) {
         try {
-          const fallback = await callCompatibleFallback(
-            env, db, messages, maxTokens, "groq", item.modelId, item.defaultReasoning
-          );
-          return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
+          const fallback = await callCompatibleFallback(env, db, messages, maxTokens, "groq", item.modelId, item.defaultReasoning);
+          return { ...fallback, fallbackFrom: selectedOverride ? "pollinations-override/" + selectedOverride : "openrouter/" + primaryId };
         } catch (error) {
-          const detail = openRouterErrorDetail(error?.message || error);
+          const detail = safeProviderDiagnostic(error?.message || error, 240);
           fallbackErrors.push("Groq " + item.modelId + ": " + detail);
           console.log("Groq fallback failed (" + item.modelId + "): " + detail);
         }
       }
     } else {
       fallbackErrors.push("Groq: GROQ_API_KEY is not configured");
-      console.log("Groq fallbacks skipped: GROQ_API_KEY is not configured.");
     }
 
-    // Mistral is intentionally after all Groq candidates; it is attempted only when its key exists.
     if (env.MISTRAL_API_KEY) {
       const mistralModel = configuredMistralModel(env);
       try {
-        const fallback = await callCompatibleFallback(
-          env, db, messages, maxTokens, "mistral", mistralModel, ""
-        );
-        return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
+        const fallback = await callCompatibleFallback(env, db, messages, maxTokens, "mistral", mistralModel, "");
+        return { ...fallback, fallbackFrom: selectedOverride ? "pollinations-override/" + selectedOverride : "openrouter/" + primaryId };
       } catch (error) {
-        const detail = openRouterErrorDetail(error?.message || error);
+        const detail = safeProviderDiagnostic(error?.message || error, 240);
         fallbackErrors.push("Mistral " + mistralModel + ": " + detail);
         console.log("Mistral fallback failed (" + mistralModel + "): " + detail);
       }
     } else {
       fallbackErrors.push("Mistral: MISTRAL_API_KEY is not configured");
-      console.log("Mistral fallback skipped: MISTRAL_API_KEY is not configured.");
     }
 
-    try {
-      const fallback = await callPollinationsModel(env, db, messages, maxTokens);
-      return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
-    } catch (error) {
-      const pollinationsError = openRouterErrorDetail(error?.message || error);
-      fallbackErrors.push("Pollinations: " + pollinationsError);
-      const detail = "Primary " + primaryId + ": " + (primaryError || "unavailable") +
-        "; " + fallbackErrors.join("; ");
-      console.log(JSON.stringify({
-        event: "model_stack_failure",
-        provider: "openrouter",
-        model: primaryId,
-        detail: detail.slice(0, 1000)
-      }));
-      throw new Error("No configured text provider is responding right now. Please retry shortly.");
+    // Pollinations stays last unless the user explicitly selected a Pollinations override,
+    // in which case we already attempted it above.
+    if (!selectedOverride) {
+      try {
+        const fallback = await callPollinationsModel(env, db, messages, maxTokens);
+        return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
+      } catch (error) {
+        fallbackErrors.push("Pollinations: " + safeProviderDiagnostic(error?.message || error, 240));
+      }
     }
+    const detail = "Primary " + primaryId + ": " + (primaryError || "unavailable") + "; " + fallbackErrors.join("; ");
+    console.log(JSON.stringify({ event: "model_stack_failure", provider: "openrouter", model: primaryId, detail: detail.slice(0, 1600) }));
+    await saveLatestModelFailure(env, detail, "text_inference");
+    const failure = new Error("No configured text provider is responding right now. Please retry shortly.");
+    failure.diagnosticDetail = detail;
+    throw failure;
   }
 
-  if (provider !== "openrouter" && provider !== "pollinations") {
+  if (provider !== "pollinations") {
     console.log("Unknown PRIMARY_MODEL_PROVIDER value; using the existing Pollinations route. provider=" + provider.slice(0, 40));
   }
-  return callPollinationsModel(env, db, messages, maxTokens);
+  try { return await callPollinationsModel(env, db, messages, maxTokens); }
+  catch (error) {
+    const detail = safeProviderDiagnostic(error?.message || error, 1600);
+    await saveLatestModelFailure(env, detail, "pollinations_inference");
+    if (!error.diagnosticDetail) error.diagnosticDetail = detail;
+    throw error;
+  }
 }
-
 async function fetchReferencedMessage(env, db, sourceMessage) {
   const reference = sourceMessage?.message_reference || sourceMessage?.reference || null;
   if (!reference?.message_id) return null;
@@ -2966,8 +3055,8 @@ function buildMultimodalUserContent(query, currentMessage, referencedMessage, re
     });
     if (!unique.length) return;
     parts.push({ type: "text", text: label });
-    for (const image of unique.slice(0, 4 - Math.max(0, parts.filter(part => part.type === "image_url").length))) {
-      if (parts.filter(part => part.type === "image_url").length >= 4) break;
+    for (const image of unique.slice(0, 3 - Math.max(0, parts.filter(part => part.type === "image_url").length))) {
+      if (parts.filter(part => part.type === "image_url").length >= 3) break;
       parts.push({ type: "image_url", image_url: image });
     }
   };
@@ -3043,7 +3132,7 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
   const clean = normalize(query);
   let webResults = [];
   let webSearchError = "";
-  const webSearchEnabled = (await setting(db, "web_search_enabled")) !== "off";
+  const webSearchEnabled = (await safeSetting(db, "web_search_enabled", "on")) !== "off";
   if (wantsWebSearch(query, options.forceWebSearch) && webSearchEnabled) {
     try { webResults = await searchWeb(query); }
     catch (error) { webSearchError = String(error.message || error).slice(0, 180); }
@@ -3308,10 +3397,11 @@ function discordAccountCreatedAt(id) {
   try { return new Date(Number((BigInt(id) >> 22n) + 1420070400000n)).toISOString(); }
   catch { return "Unavailable"; }
 }
-async function getMemberInspection(env, message) {
+async function getMemberInspection(env, message, allowSelf = false) {
   const mentions = Array.isArray(message.mentions) ? message.mentions : [];
-  const target = mentions.find(user => user && String(user.id) !== String(env.BOT_USER_ID || "") && String(user.id) !== String(message.author?.id || ""));
-  if (!target?.id) throw new Error("Tag the member you want to inspect, for example: !inspect @member.");
+  const mentionedTarget = mentions.find(user => user && String(user.id) !== String(env.BOT_USER_ID || "") && String(user.id) !== String(message.author?.id || ""));
+  const target = mentionedTarget || (allowSelf && message.author?.id && String(message.author.id) !== String(env.BOT_USER_ID || "") ? message.author : null);
+  if (!target?.id) throw new Error("Tag the member you want to inspect, or ask about your own PFP.");
   const userId = String(target.id);
   let user = target;
   try { user = await discord(env, "/users/" + userId); }
@@ -3347,6 +3437,12 @@ async function getMemberInspection(env, message) {
 }
 
 const CONVY_VERIFIED_ADULT_ROLE_ID = "1530567633366155284";
+
+function isOwnAvatarRequest(query) {
+  const value = normalize(query);
+  return /\b(?:my|mine)\s+(?:discord\s+)?(?:pfp|dp|avatar|profile picture|profile pic|display picture)\b/.test(value) ||
+    /\b(?:how does|what do you think of|rate|review|describe)\b[\s\S]{0,60}\bmy\s+(?:pfp|dp|avatar|profile picture|profile pic|display picture)\b/.test(value);
+}
 
 function hasVerifiedAdultRole(message) {
   const roles = message?.member?.roles;
@@ -3406,6 +3502,37 @@ async function handleMention(env, message) {
   }
   const command = query.trim();
   const normalizedCommand = normalize(command);
+  const asksLastError = normalizedCommand === "last error" ||
+    ["give exact error", "give me exact error", "show exact error", "show me exact error", "exact error",
+      "full error", "what was the error", "what is the error", "whats the error",
+      "show last error", "show me the last error"].includes(normalizedCommand) ||
+    /\b(?:give|show|tell me|what was|what is)\b[\s\S]{0,30}\b(?:last|exact|full|previous)\s+error\b/.test(normalizedCommand);
+  if (asksLastError) {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Detailed provider diagnostics are creator-only.", message.id);
+      return;
+    }
+    try {
+      const state = await gatewayControl(env, "/models/last-error");
+      const last = state?.error;
+      if (!last?.detail) {
+        await sendUserReply(env, message, "No provider failure has been captured yet. Retry the failing action, then ask for the exact error again.", message.id);
+      } else if (Date.now() - Number(last.at || 0) > 24 * 60 * 60 * 1000) {
+        await sendUserReply(env, message, "The last recorded provider failure is older than 24 hours. Retry the failing action and ask again for the current error.", message.id);
+      } else {
+        const detail = safeProviderDiagnostic(last.detail, 1350);
+        await sendUserReply(env, message,
+          "**Latest recorded provider failure** · " + new Date(Number(last.at)).toISOString() +
+          "\nSource: " + String(last.source || "inference") +
+          "\nError: " + detail +
+          "\nThis is the saved Worker diagnostic, not a guess from chat history.",
+          message.id);
+      }
+    } catch (error) {
+      await sendUserReply(env, message, "I couldn't read the latest provider diagnostic: " + safeProviderDiagnostic(error?.message || error, 200), message.id);
+    }
+    return;
+  }
   // Handle common social banter locally so irrelevant retrieved history cannot hijack it.
   if (/\b(?:learn|practice|get better at|improve your)\b.{0,24}\b(?:flirting|flirt|rizz)\b/.test(normalizedCommand) ||
       /\b(?:flirting|flirt|rizz)\b.{0,24}\b(?:learn|practice|get better)\b/.test(normalizedCommand)) {
@@ -3443,6 +3570,18 @@ async function handleMention(env, message) {
       await sendUserReply(env, message, answer, message.id);
     } catch (error) {
       await sendUserReply(env, message, "I couldn't inspect that profile. " + String(error.message || error).slice(0, 180), message.id);
+    }
+    return;
+  }
+  if (isOwnAvatarRequest(query)) {
+    try {
+      const profileInspection = await getMemberInspection(env, message, true);
+      const prompt = "The user is asking for feedback on their own Discord PFP/profile picture. Inspect only the supplied public avatar/banner images and give concise, candid aesthetic feedback on composition, color, clarity, and overall vibe. Do not infer real-world identity or personality from the image, and do not invent profile details.\nMember: " + profileInspection.targetName;
+      const answer = await generateAnswer(env, env.DB, prompt, message.channel_id, message, { profileInspection });
+      await sendUserReply(env, message, answer, message.id);
+    } catch (error) {
+      await saveLatestModelFailure(env, error?.message || error, "profile_inspection");
+      await sendUserReply(env, message, "I couldn't inspect your profile picture this time. Retry once, or ask me 'Give exact error' for the latest provider diagnostic.", message.id);
     }
     return;
   }
@@ -3917,11 +4056,12 @@ async function handleMention(env, message) {
     const answer = await generateAnswer(env, env.DB, adultModeQuery, message.channel_id, message);
     await sendUserReply(env, message, answer, message.id);
   } catch (error) {
-    const detail = openRouterErrorDetail(error?.message || error);
+    const detail = safeProviderDiagnostic(error?.diagnosticDetail || error?.message || error, 1600);
     console.log(JSON.stringify({ event: "answer_generation_failure", channel_id: String(message.channel_id || ""), detail: detail.slice(0, 800) }));
+    await saveLatestModelFailure(env, detail, "answer_generation_failure");
     const alert = await claimAdminAlert(env, env.DB, "answer-failure");
     const text = (alert?.mentions ? alert.mentions + "\n" : "") +
-      "I couldn't get a usable response from the configured AI providers this time. Please retry once; if it happens again, tag an admin with this message's time. The failure details are in the Worker logs.";
+      "I couldn't get a usable response from the configured providers this time. Please retry once; ask me 'Give exact error' for the latest saved diagnostic.";
     await sendUserReply(env, message, text, message.id, alert?.targets || null);
   }
   } finally {
@@ -4186,6 +4326,9 @@ export class DiscordGateway extends DurableObject {
     super(ctx, env);
     this.ctx = ctx;
     this.env = env;
+    this.gatewayEnv = new Proxy(env, {
+      get: (target, property) => property === "__CONVY_GATEWAY_INSTANCE" ? this : Reflect.get(target, property, target)
+    });
     this.socket = null;
     this.sequence = null;
     this.heartbeatTimer = null;
@@ -4328,6 +4471,22 @@ export class DiscordGateway extends DurableObject {
       }
       await this.ctx.storage.put("model_catalog_snapshot", nextSnapshot);
       return json({ ok: true, updated: nextModels.some(model => String(model.model_id) === id) });
+    }
+    if (path === "/models/last-error" && request.method === "GET") {
+      return json({ ok: true, error: await this.ctx.storage.get("model_last_error") || null });
+    }
+    if (path === "/models/last-error" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      const detail = safeProviderDiagnostic(body.detail || "", 1800);
+      if (!detail) return json({ ok: false, error: "An error detail is required." }, 400);
+      const failure = {
+        at: Math.max(0, Number(body.at) || Date.now()),
+        source: String(body.source || "inference").slice(0, 80),
+        detail
+      };
+      await this.ctx.storage.put("model_last_error", failure);
+      return json({ ok: true, error: failure });
     }
     if (path === "/control/status") {
       return json({ ok: true, paused: Boolean(await this.ctx.storage.get("convx_paused")), changedAt: await this.ctx.storage.get("convx_pause_changed_at") || null });
@@ -4849,10 +5008,10 @@ if (path === "/issues/draft/complete" && request.method === "POST") {
     this.channelActive.set(channelId, (this.channelActive.get(channelId) || 0) + 1);
     this.globalActiveRequests++;
     this.channelLastStartedAt.set(channelId, Date.now());
-    Promise.resolve().then(() => handleMention(this.env, item.message)).catch(async error => {
+    Promise.resolve().then(() => handleMention(this.gatewayEnv, item.message)).catch(async error => {
       const detail = String(error?.message || error).slice(0, 160);
       console.log("Queued mention handler failed (" + channelId + "): " + detail);
-      try { await postAdminAlert(this.env, this.env.DB, "mention-handler-failure", "A message handler failed; the queue will continue. " + detail); } catch {}
+      try { await postAdminAlert(this.gatewayEnv, this.env.DB, "mention-handler-failure", "A message handler failed; the queue will continue. " + detail); } catch {}
     }).finally(() => {
       item.resolve();
       const active = Math.max(0, (this.channelActive.get(channelId) || 1) - 1);
@@ -4913,7 +5072,7 @@ if (path === "/issues/draft/complete" && request.method === "POST") {
       const contentWithoutMention = String(message.content || "").replace(
         new RegExp("<@!?" + String(this.env.BOT_USER_ID || "") + ">"), ""
       ).trim();
-      if (isCreator(message) && /^!/.test(contentWithoutMention)) await handleMention(this.env, message);
+      if (isCreator(message) && /^!/.test(contentWithoutMention)) await handleMention(this.gatewayEnv, message);
       else await this.enqueueChannelMessage(message);
     } finally {
       this.inFlightMessages.delete(messageId);
@@ -4951,6 +5110,7 @@ export default {
           pollinationsKey: Boolean(env.POLLINATIONS_API_KEY),
           openRouterKey: Boolean(env.OPENROUTER_API_KEY),
           groqKey: Boolean(env.GROQ_API_KEY),
+          groqVisionEnabled: String(env.GROQ_VISION_ENABLED || "").trim().toLowerCase() === "true",
           mistralKey: Boolean(env.MISTRAL_API_KEY),
           primaryModelProvider: configuredPrimaryProvider(env),
           openRouterModel: configuredOpenRouterModel(env),
