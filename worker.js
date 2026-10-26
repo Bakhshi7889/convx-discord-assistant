@@ -3500,6 +3500,37 @@ async function handleMention(env, message) {
   }
   const command = query.trim();
   const normalizedCommand = normalize(command);
+  const asksLastError = normalizedCommand === "last error" ||
+    ["give exact error", "give me exact error", "show exact error", "show me exact error", "exact error",
+      "full error", "what was the error", "what is the error", "whats the error",
+      "show last error", "show me the last error"].includes(normalizedCommand) ||
+    /\b(?:give|show|tell me|what was|what is)\b[\s\S]{0,30}\b(?:last|exact|full|previous)\s+error\b/.test(normalizedCommand);
+  if (asksLastError) {
+    if (!isCreator(message)) {
+      await sendUserReply(env, message, "Detailed provider diagnostics are creator-only.", message.id);
+      return;
+    }
+    try {
+      const state = await gatewayControl(env, "/models/last-error");
+      const last = state?.error;
+      if (!last?.detail) {
+        await sendUserReply(env, message, "No provider failure has been captured yet. Retry the failing action, then ask for the exact error again.", message.id);
+      } else if (Date.now() - Number(last.at || 0) > 24 * 60 * 60 * 1000) {
+        await sendUserReply(env, message, "The last recorded provider failure is older than 24 hours. Retry the failing action and ask again for the current error.", message.id);
+      } else {
+        const detail = safeProviderDiagnostic(last.detail, 1350);
+        await sendUserReply(env, message,
+          "**Latest recorded provider failure** · " + new Date(Number(last.at)).toISOString() +
+          "\nSource: " + String(last.source || "inference") +
+          "\nError: " + detail +
+          "\nThis is the saved Worker diagnostic, not a guess from chat history.",
+          message.id);
+      }
+    } catch (error) {
+      await sendUserReply(env, message, "I couldn't read the latest provider diagnostic: " + safeProviderDiagnostic(error?.message || error, 200), message.id);
+    }
+    return;
+  }
   // Handle common social banter locally so irrelevant retrieved history cannot hijack it.
   if (/\b(?:learn|practice|get better at|improve your)\b.{0,24}\b(?:flirting|flirt|rizz)\b/.test(normalizedCommand) ||
       /\b(?:flirting|flirt|rizz)\b.{0,24}\b(?:learn|practice|get better)\b/.test(normalizedCommand)) {
@@ -3537,6 +3568,18 @@ async function handleMention(env, message) {
       await sendUserReply(env, message, answer, message.id);
     } catch (error) {
       await sendUserReply(env, message, "I couldn't inspect that profile. " + String(error.message || error).slice(0, 180), message.id);
+    }
+    return;
+  }
+  if (isOwnAvatarRequest(query)) {
+    try {
+      const profileInspection = await getMemberInspection(env, message, true);
+      const prompt = "The user is asking for feedback on their own Discord PFP/profile picture. Inspect only the supplied public avatar/banner images and give concise, candid aesthetic feedback on composition, color, clarity, and overall vibe. Do not infer real-world identity or personality from the image, and do not invent profile details.\nMember: " + profileInspection.targetName;
+      const answer = await generateAnswer(env, env.DB, prompt, message.channel_id, message, { profileInspection });
+      await sendUserReply(env, message, answer, message.id);
+    } catch (error) {
+      await saveLatestModelFailure(env, error?.message || error, "profile_inspection");
+      await sendUserReply(env, message, "I couldn't inspect your profile picture this time. Retry once, or ask me 'Give exact error' for the latest provider diagnostic.", message.id);
     }
     return;
   }
