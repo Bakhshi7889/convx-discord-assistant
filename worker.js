@@ -55,7 +55,7 @@ const CONVY_CREATOR_NAME = "@B A K H S H I";
 const CONVY_BUILD_VERSION = "convx-2026-10-26-r44";
 const CONVY_CURRENT_RELEASE_NOTES = [
   "Fix nested Gateway self-calls from inside the Durable Object by dispatching control routes directly, preventing the observed D1 subrequest-depth failure during replies.",
-  "Use Groq Qwen 3.8 27B for vision requests when available, instead of sending every image request straight to Pollinations.",
+  "Add an opt-in Groq Qwen 3.8 27B vision fallback for image requests; it stays disabled by default to avoid unexpected metered inference charges.",
   "Automatically inspect a member's own public Discord avatar/banner when they ask how their PFP looks.",
   "Save the latest provider failure separately from chat history and return it for creator requests such as 'Give exact error' or !last-error.",
   "Let inference continue with safe defaults when a nonessential D1 settings read fails.",
@@ -143,7 +143,7 @@ const CONVY_RELEASE_HISTORY = [
 ];
 const CONVY_RELEASE_NOTES = [
   "Fix nested Gateway self-calls in the Durable Object that can trigger D1 subrequest-depth errors during inference.",
-  "Route image questions through the configured Groq Qwen 3.8 27B vision model before Pollinations, and inspect a user's own Discord avatar for natural PFP questions.",
+  "Add opt-in Groq Qwen 3.8 27B vision routing, but require explicit GROQ_VISION_ENABLED=true because provider inference may be metered; inspect a user's own Discord avatar for natural PFP questions.",
   "Persist the latest provider failure and answer exact-error requests from live diagnostics rather than old chat history.",
   "Use safe defaults for nonessential settings reads so temporary D1 errors do not automatically abort model routing.",
   "Add a last-resort correction for identity questions when the generated reply impersonates a member or attributes an unverified developer/owner role.",
@@ -2839,7 +2839,7 @@ async function callFreeModel(env, db, messages, maxTokens = 550) {
       try { return await callPollinationsModel(env, db, messages, maxTokens); }
       catch (error) { failures.push("Selected Pollinations vision route: " + safeProviderDiagnostic(error?.message || error, 240)); }
     }
-    if (env.GROQ_API_KEY) {
+    if (String(env.GROQ_VISION_ENABLED || "").trim().toLowerCase() === "true" && env.GROQ_API_KEY) {
       for (const item of configuredGroqFallbackModels(env).filter(candidate => GROQ_VISION_MODEL_IDS.has(candidate.modelId))) {
         try {
           return await callCompatibleFallback(env, db, messages, maxTokens, "groq", item.modelId, item.defaultReasoning);
@@ -2849,6 +2849,8 @@ async function callFreeModel(env, db, messages, maxTokens = 550) {
           console.log("Groq vision fallback failed (" + item.modelId + "): " + detail);
         }
       }
+    } else if (String(env.GROQ_VISION_ENABLED || "").trim().toLowerCase() !== "true") {
+      failures.push("Groq vision is disabled by default to avoid unexpected metered image inference; set GROQ_VISION_ENABLED=true to opt in.");
     } else {
       failures.push("Groq vision: GROQ_API_KEY is not configured");
     }
