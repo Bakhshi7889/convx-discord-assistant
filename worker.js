@@ -5110,6 +5110,7 @@ export default {
           pollinationsKey: Boolean(env.POLLINATIONS_API_KEY),
           openRouterKey: Boolean(env.OPENROUTER_API_KEY),
           groqKey: Boolean(env.GROQ_API_KEY),
+          groqVisionEnabled: String(env.GROQ_VISION_ENABLED || "").trim().toLowerCase() === "true",
           mistralKey: Boolean(env.MISTRAL_API_KEY),
           primaryModelProvider: configuredPrimaryProvider(env),
           openRouterModel: configuredOpenRouterModel(env),
