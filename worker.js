@@ -3130,7 +3130,7 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
   const clean = normalize(query);
   let webResults = [];
   let webSearchError = "";
-  const webSearchEnabled = (await setting(db, "web_search_enabled")) !== "off";
+  const webSearchEnabled = (await safeSetting(db, "web_search_enabled", "on")) !== "off";
   if (wantsWebSearch(query, options.forceWebSearch) && webSearchEnabled) {
     try { webResults = await searchWeb(query); }
     catch (error) { webSearchError = String(error.message || error).slice(0, 180); }
@@ -3395,10 +3395,11 @@ function discordAccountCreatedAt(id) {
   try { return new Date(Number((BigInt(id) >> 22n) + 1420070400000n)).toISOString(); }
   catch { return "Unavailable"; }
 }
-async function getMemberInspection(env, message) {
+async function getMemberInspection(env, message, allowSelf = false) {
   const mentions = Array.isArray(message.mentions) ? message.mentions : [];
-  const target = mentions.find(user => user && String(user.id) !== String(env.BOT_USER_ID || "") && String(user.id) !== String(message.author?.id || ""));
-  if (!target?.id) throw new Error("Tag the member you want to inspect, for example: !inspect @member.");
+  const mentionedTarget = mentions.find(user => user && String(user.id) !== String(env.BOT_USER_ID || "") && String(user.id) !== String(message.author?.id || ""));
+  const target = mentionedTarget || (allowSelf && message.author?.id && String(message.author.id) !== String(env.BOT_USER_ID || "") ? message.author : null);
+  if (!target?.id) throw new Error("Tag the member you want to inspect, or ask about your own PFP.");
   const userId = String(target.id);
   let user = target;
   try { user = await discord(env, "/users/" + userId); }
@@ -3434,6 +3435,12 @@ async function getMemberInspection(env, message) {
 }
 
 const CONVY_VERIFIED_ADULT_ROLE_ID = "1530567633366155284";
+
+function isOwnAvatarRequest(query) {
+  const value = normalize(query);
+  return /\b(?:my|mine)\s+(?:discord\s+)?(?:pfp|dp|avatar|profile picture|profile pic|display picture)\b/.test(value) ||
+    /\b(?:how does|what do you think of|rate|review|describe)\b[\s\S]{0,60}\bmy\s+(?:pfp|dp|avatar|profile picture|profile pic|display picture)\b/.test(value);
+}
 
 function hasVerifiedAdultRole(message) {
   const roles = message?.member?.roles;
