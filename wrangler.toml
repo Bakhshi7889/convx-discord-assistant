@@ -34,3 +34,6 @@ class_name = "DiscordGateway"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["DiscordGateway"]
+
+[ai]
+binding = "AI"
