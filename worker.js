@@ -45,6 +45,7 @@ const VISION_MODEL_IDS = new Set([
 ]);
 // Groq docs list this configured Qwen model as accepting text and image inputs.
 const GROQ_VISION_MODEL_IDS = new Set(["qwen/qwen3.8-27b"]);
+const CLOUDFLARE_VISION_MODEL_ID = "@cf/moondream/moondream3.1-9B-A2B";
 // Keep tool-setting support explicit and independent of preferred rank.
 const SETTINGS_CAPABLE_MODEL_IDS = new Set([
   "community/YoannDev90/muse-glimmer-30b:free",
@@ -52,8 +53,9 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-26-r45";
+const CONVY_BUILD_VERSION = "convx-2026-10-26-r46";
 const CONVY_CURRENT_RELEASE_NOTES = [
+  "Add Cloudflare Workers AI Moondream 3.1 as the final image fallback for OCR and basic visual questions when existing vision routes fail.",
   "Preserve underlying provider diagnostics when profile-picture inspection fails instead of overwriting them with the generic user-facing error.",
   "Fix nested Gateway self-calls from inside the Durable Object by dispatching control routes directly, preventing the observed D1 subrequest-depth failure during replies.",
   "Add an opt-in Groq Qwen 3.8 27B vision fallback for image requests; it stays disabled by default to avoid unexpected metered inference charges.",
@@ -143,6 +145,7 @@ const CONVY_RELEASE_HISTORY = [
   }
 ];
 const CONVY_RELEASE_NOTES = [
+  "Add Cloudflare Workers AI Moondream 3.1 as the final image fallback for OCR and basic visual questions when existing vision routes fail.",
   "Fix nested Gateway self-calls in the Durable Object that can trigger D1 subrequest-depth errors during inference.",
   "Add opt-in Groq Qwen 3.8 27B vision routing, but require explicit GROQ_VISION_ENABLED=true because provider inference may be metered; inspect a user's own Discord avatar for natural PFP questions.",
   "Persist the latest provider failure and answer exact-error requests from live diagnostics rather than old chat history.",
@@ -2825,6 +2828,79 @@ async function callCompatibleFallback(env, db, messages, maxTokens, provider, mo
   }
 }
 
+function imageUrlFromMessageContent(messages) {
+  for (const message of [...(messages || [])].reverse()) {
+    if (!Array.isArray(message?.content)) continue;
+    for (const part of message.content) {
+      if (part?.type !== "image_url") continue;
+      const value = part.image_url;
+      const url = typeof value === "string" ? value : String(value?.url || "");
+      if (/^https:\/\//i.test(url) || /^data:image\//i.test(url)) return url;
+    }
+  }
+  return "";
+}
+function lastUserText(messages) {
+  for (const message of [...(messages || [])].reverse()) {
+    if (message?.role !== "user") continue;
+    if (typeof message.content === "string") return message.content.slice(0, 2400);
+    if (Array.isArray(message.content)) {
+      return message.content.filter(part => part?.type === "text" && typeof part.text === "string")
+        .map(part => part.text).join("\n").slice(0, 2400);
+    }
+  }
+  return "";
+}
+async function callCloudflareVisionFallback(env, messages) {
+  if (!env.AI || typeof env.AI.run !== "function") {
+    throw new Error("Cloudflare Workers AI binding AI is not configured.");
+  }
+  const image = imageUrlFromMessageContent(messages);
+  if (!image) throw new Error("No public HTTPS image URL or image data URI was available to the OCR/vision fallback.");
+  const requestText = lastUserText(messages);
+  const asksOcr = /\b(?:ocr|read (?:the )?(?:text|words)|extract text|transcribe|what (?:does|is written in)|text in (?:this|the) image|read this screenshot)\b/i.test(requestText);
+  const question = asksOcr
+    ? "Transcribe all readable text in the image as accurately as possible, preserving line breaks and punctuation. Do not guess at unclear text. If no readable text is visible, say that plainly."
+    : "Answer the user's request about the image directly and concisely. Describe visible details accurately; do not invent details or infer a real person's identity or personality. User request: " +
+      requestText.replace(/Images attached to the current Discord message:|Images attached to the message being replied to:|Public Discord profile avatar\/banner supplied for visual inspection:/g, "").trim();
+  const started = Date.now();
+  try {
+    const result = await env.AI.run(CLOUDFLARE_VISION_MODEL_ID, {
+      task: "query",
+      image,
+      question
+    });
+    const answer = typeof result === "string"
+      ? result.trim()
+      : String(result?.response || result?.answer || result?.text || result?.description || "").trim();
+    if (!answer) throw new Error("Moondream returned an empty response.");
+    console.log(JSON.stringify({
+      event: "model_request",
+      provider: "cloudflare_workers_ai",
+      model: CLOUDFLARE_VISION_MODEL_ID,
+      outcome: "success",
+      latency_ms: Date.now() - started,
+      task: asksOcr ? "ocr" : "visual_query"
+    }));
+    return {
+      content: answer.slice(0, 6000),
+      modelId: CLOUDFLARE_VISION_MODEL_ID,
+      provider: "cloudflare_workers_ai",
+      fallbackFrom: "pollinations_vision"
+    };
+  } catch (error) {
+    const detail = safeProviderDiagnostic(error?.message || error, 260);
+    console.log(JSON.stringify({
+      event: "model_request",
+      provider: "cloudflare_workers_ai",
+      model: CLOUDFLARE_VISION_MODEL_ID,
+      outcome: "failure",
+      latency_ms: Date.now() - started,
+      error: detail
+    }));
+    throw new Error("Cloudflare Workers AI " + CLOUDFLARE_VISION_MODEL_ID + " failed: " + detail);
+  }
+}
 async function callFreeModel(env, db, messages, maxTokens = 550) {
   const provider = configuredPrimaryProvider(env);
   const selectedOverride = String(await safeSetting(db, "owner_selected_model_id", "") || "").trim();
@@ -2858,6 +2934,13 @@ async function callFreeModel(env, db, messages, maxTokens = 550) {
     if (!preferPollinationsVision) {
       try { return await callPollinationsModel(env, db, messages, maxTokens); }
       catch (error) { failures.push("Pollinations vision: " + safeProviderDiagnostic(error?.message || error, 240)); }
+    }
+    // Final image fallback uses Cloudflare Workers AI Moondream for OCR and basic visual queries.
+    try { return await callCloudflareVisionFallback(env, messages); }
+    catch (error) {
+      const detail = safeProviderDiagnostic(error?.message || error, 260);
+      failures.push("Cloudflare Workers AI vision/OCR: " + detail);
+      console.log("Cloudflare Workers AI vision/OCR fallback failed: " + detail);
     }
     const detail = failures.join("; ") || "No configured vision-capable model was available.";
     await saveLatestModelFailure(env, detail, "vision_inference");
