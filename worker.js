@@ -43,6 +43,8 @@ const VISION_MODEL_IDS = new Set([
   "community/scriptsnsenses-sys/diffusiongema-26B-free",
   "community/YoannDev90/muse-glimmer-30b:free"
 ]);
+// Groq docs list this configured Qwen model as accepting text and image inputs.
+const GROQ_VISION_MODEL_IDS = new Set(["qwen/qwen3.8-27b"]);
 // Keep tool-setting support explicit and independent of preferred rank.
 const SETTINGS_CAPABLE_MODEL_IDS = new Set([
   "community/YoannDev90/muse-glimmer-30b:free",
@@ -50,8 +52,13 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-25-r43";
+const CONVY_BUILD_VERSION = "convx-2026-10-26-r44";
 const CONVY_CURRENT_RELEASE_NOTES = [
+  "Fix nested Gateway self-calls from inside the Durable Object by dispatching control routes directly, preventing the observed D1 subrequest-depth failure during replies.",
+  "Use Groq Qwen 3.8 27B for vision requests when available, instead of sending every image request straight to Pollinations.",
+  "Automatically inspect a member's own public Discord avatar/banner when they ask how their PFP looks.",
+  "Save the latest provider failure separately from chat history and return it for creator requests such as 'Give exact error' or !last-error.",
+  "Let inference continue with safe defaults when a nonessential D1 settings read fails.",
   "Guard identity-question replies against impersonating known members or falsely assigning developer/owner roles; route corrections to the verified creator identity.",
   "Explain when !model is given an automatic OpenRouter/Groq/Mistral provider model instead of a Pollinations catalog choice; support !providers as an alias for !provider.",
   "Ground recent channel history in Discord author IDs and add stricter rules against impersonating members or inventing ownership/developer claims.",
@@ -135,6 +142,10 @@ const CONVY_RELEASE_HISTORY = [
   }
 ];
 const CONVY_RELEASE_NOTES = [
+  "Fix nested Gateway self-calls in the Durable Object that can trigger D1 subrequest-depth errors during inference.",
+  "Route image questions through the configured Groq Qwen 3.8 27B vision model before Pollinations, and inspect a user's own Discord avatar for natural PFP questions.",
+  "Persist the latest provider failure and answer exact-error requests from live diagnostics rather than old chat history.",
+  "Use safe defaults for nonessential settings reads so temporary D1 errors do not automatically abort model routing.",
   "Add a last-resort correction for identity questions when the generated reply impersonates a member or attributes an unverified developer/owner role.",
   "Clarify that !model changes Pollinations overrides, while OpenRouter/Groq/Mistral are part of automatic provider routing; accept !providers as a diagnostic alias.",
   "Ground speaker history in Discord user IDs and strengthen identity/ownership anti-hallucination rules.",
@@ -183,6 +194,14 @@ function json(data, status = 200) {
 }
 function setting(db, key) {
   return db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first().then(row => row?.value ?? null);
+}
+async function safeSetting(db, key, fallback = null) {
+  try { return await setting(db, key); }
+  catch (error) {
+    console.log("D1 setting read skipped; using safe default for " + String(key || "").slice(0, 60) + ": " +
+      String(error?.message || error).replace(/[\r\n]+/g, " ").slice(0, 160));
+    return fallback;
+  }
 }
 async function setSetting(db, key, value) {
   await db.prepare(
@@ -240,9 +259,16 @@ function isCreator(message) {
   return String(message?.author?.id || "") === CONVY_CREATOR_USER_ID;
 }
 async function gatewayControl(env, path, options = {}) {
-  if (!env.DISCORD_GATEWAY) throw new Error("The Gateway control store is unavailable.");
-  const id = env.DISCORD_GATEWAY.idFromName("convx-discord-gateway");
-  const response = await env.DISCORD_GATEWAY.get(id).fetch("https://gateway" + path, options);
+  const directInstance = env?.__CONVY_GATEWAY_INSTANCE;
+  let response;
+  if (directInstance && typeof directInstance.fetch === "function") {
+    // Avoid calling the same Durable Object through its binding from inside itself.
+    response = await directInstance.fetch(new Request("https://gateway" + path, options));
+  } else {
+    if (!env.DISCORD_GATEWAY) throw new Error("The Gateway control store is unavailable.");
+    const id = env.DISCORD_GATEWAY.idFromName("convx-discord-gateway");
+    response = await env.DISCORD_GATEWAY.get(id).fetch("https://gateway" + path, options);
+  }
   let body = {};
   try { body = await response.json(); } catch {}
   if (!response.ok || body.ok === false) throw new Error(String(body.error || ("Gateway control HTTP " + response.status)));
@@ -1958,9 +1984,9 @@ async function callPollinationsModel(env,db,messages,maxTokens=550) {
     throw new Error("Pollinations returned no eligible free community text models with no billed text-token rates. No paid model was attempted.");
   }
 
-  const configuredReasoning = await setting(db, "reasoning_override");
-  const configuredTemperature = await setting(db, "temperature_override");
-  const configuredMaxTokens = await setting(db, "max_tokens_override");
+  const configuredReasoning = await safeSetting(db, "reasoning_override");
+  const configuredTemperature = await safeSetting(db, "temperature_override");
+  const configuredMaxTokens = await safeSetting(db, "max_tokens_override");
   const lockedSettings = {};
   if (["low", "medium", "high"].includes(String(configuredReasoning || ""))) lockedSettings.reasoning_effort = String(configuredReasoning);
   if (configuredTemperature !== null && configuredTemperature !== "" && Number.isFinite(Number(configuredTemperature)) && Number(configuredTemperature) >= 0 && Number(configuredTemperature) <= 1) lockedSettings.temperature = Number(configuredTemperature);
@@ -1972,7 +1998,7 @@ async function callPollinationsModel(env,db,messages,maxTokens=550) {
   const pinnedOrder = hasImages
     ? PREFERRED_MODEL_ORDER.filter(id => VISION_MODEL_IDS.has(id))
     : PREFERRED_MODEL_ORDER;
-  const ownerSelectedId = await setting(db, "owner_selected_model_id");
+  const ownerSelectedId = await safeSetting(db, "owner_selected_model_id", "");
   const routingOrder = [
     ...(ownerSelectedId && (!hasImages || VISION_MODEL_IDS.has(ownerSelectedId)) ? [ownerSelectedId] : []),
     ...pinnedOrder
@@ -2332,6 +2358,29 @@ function retryAfterDelayMs(value, now = Date.now()) {
 function openRouterErrorDetail(value) {
   return String(value || "").replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").slice(0, 170);
 }
+function safeProviderDiagnostic(value, maxLength = 1800) {
+  return String(value || "")
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk-or-v1-|sk-|gsk_|pplx-|nvapi-|cfut_)[A-Za-z0-9_-]{8,}\b/gi, "[redacted]")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .slice(0, Math.max(100, Math.min(2400, Number(maxLength) || 1800)));
+}
+async function saveLatestModelFailure(env, detail, source = "inference") {
+  try {
+    await gatewayControl(env, "/models/last-error", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        at: Date.now(),
+        source: String(source || "inference").slice(0, 80),
+        detail: safeProviderDiagnostic(detail, 1800)
+      })
+    });
+  } catch (error) {
+    console.log("Latest model failure snapshot write skipped: " + String(error?.message || error).slice(0, 120));
+  }
+}
 
 function parseOpenRouterSSE(rawBody) {
   const rows = new Map();
@@ -2511,10 +2560,10 @@ async function callOpenRouterPrimary(env, db, messages, maxTokens = 550, modelId
   let recorded = false;
   try {
     const verification = await verifyOpenRouterFreeModel(env, modelId);
-    const ownerSelectedId = await setting(db, "owner_selected_model_id");
-    const configuredReasoning = await setting(db, "reasoning_override");
-    const configuredTemperature = await setting(db, "temperature_override");
-    const configuredMaxTokens = await setting(db, "max_tokens_override");
+    const ownerSelectedId = await safeSetting(db, "owner_selected_model_id", "");
+    const configuredReasoning = await safeSetting(db, "reasoning_override");
+    const configuredTemperature = await safeSetting(db, "temperature_override");
+    const configuredMaxTokens = await safeSetting(db, "max_tokens_override");
     const lockedSettings = {};
     if (["low", "medium", "high"].includes(String(configuredReasoning || ""))) lockedSettings.reasoning_effort = String(configuredReasoning);
     if (configuredTemperature !== null && configuredTemperature !== "" && Number.isFinite(Number(configuredTemperature)) && Number(configuredTemperature) >= 0 && Number(configuredTemperature) <= 1) lockedSettings.temperature = Number(configuredTemperature);
@@ -2646,19 +2695,22 @@ async function callCompatibleFallback(env, db, messages, maxTokens, provider, mo
   if (provider !== "groq" && provider !== "mistral") throw new Error("Unsupported fallback provider.");
   const apiKey = provider === "groq" ? env.GROQ_API_KEY : env.MISTRAL_API_KEY;
   if (!apiKey) throw new Error(provider.toUpperCase() + "_API_KEY is not configured in the Cloudflare Worker.");
-  if (messages.some(message => Array.isArray(message.content) && message.content.some(part => part?.type === "image_url"))) {
-    throw new Error(provider + " fallback is text-only; image requests remain on the Pollinations vision route.");
+  const hasImages = messages.some(message =>
+    Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
+  );
+  if (hasImages && !(provider === "groq" && GROQ_VISION_MODEL_IDS.has(modelId))) {
+    throw new Error(provider + " model " + modelId + " is not on the configured vision-capable allowlist.");
   }
 
   const started = Date.now();
   const metricId = provider + "/" + modelId;
   let recorded = false;
   try {
-    const ownerSelectedId = await setting(db, "owner_selected_model_id");
-    const configuredReasoning = String(await setting(db, "reasoning_override") || "").trim().toLowerCase();
-    const configuredTemperature = await setting(db, "temperature_override");
-    const configuredMaxTokens = await setting(db, "max_tokens_override");
-    const defaults = initialResponseSettings(requestText(messages), maxTokens, false);
+    const ownerSelectedId = await safeSetting(db, "owner_selected_model_id", "");
+    const configuredReasoning = String(await safeSetting(db, "reasoning_override", "") || "").trim().toLowerCase();
+    const configuredTemperature = await safeSetting(db, "temperature_override");
+    const configuredMaxTokens = await safeSetting(db, "max_tokens_override");
+    const defaults = initialResponseSettings(requestText(messages), maxTokens, hasImages);
     const temperature = configuredTemperature !== null && configuredTemperature !== "" &&
       Number.isFinite(Number(configuredTemperature)) && Number(configuredTemperature) >= 0 && Number(configuredTemperature) <= 1
       ? Number(configuredTemperature)
@@ -2676,7 +2728,7 @@ async function callCompatibleFallback(env, db, messages, maxTokens, provider, mo
       reasoning_effort: reasoningEffort || defaults.reasoning_effort
     };
     const requestMessages = withRuntimeSnapshot(
-      env, messages, metricId, runtimeSettings, false, false, ownerSelectedId
+      env, messages, metricId, runtimeSettings, hasImages, false, ownerSelectedId
     );
     const body = {
       model: modelId,
@@ -2966,8 +3018,8 @@ function buildMultimodalUserContent(query, currentMessage, referencedMessage, re
     });
     if (!unique.length) return;
     parts.push({ type: "text", text: label });
-    for (const image of unique.slice(0, 4 - Math.max(0, parts.filter(part => part.type === "image_url").length))) {
-      if (parts.filter(part => part.type === "image_url").length >= 4) break;
+    for (const image of unique.slice(0, 3 - Math.max(0, parts.filter(part => part.type === "image_url").length))) {
+      if (parts.filter(part => part.type === "image_url").length >= 3) break;
       parts.push({ type: "image_url", image_url: image });
     }
   };
