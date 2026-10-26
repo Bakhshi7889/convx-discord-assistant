@@ -4054,11 +4054,12 @@ async function handleMention(env, message) {
     const answer = await generateAnswer(env, env.DB, adultModeQuery, message.channel_id, message);
     await sendUserReply(env, message, answer, message.id);
   } catch (error) {
-    const detail = openRouterErrorDetail(error?.message || error);
+    const detail = safeProviderDiagnostic(error?.diagnosticDetail || error?.message || error, 1600);
     console.log(JSON.stringify({ event: "answer_generation_failure", channel_id: String(message.channel_id || ""), detail: detail.slice(0, 800) }));
+    await saveLatestModelFailure(env, detail, "answer_generation_failure");
     const alert = await claimAdminAlert(env, env.DB, "answer-failure");
     const text = (alert?.mentions ? alert.mentions + "\n" : "") +
-      "I couldn't get a usable response from the configured AI providers this time. Please retry once; if it happens again, tag an admin with this message's time. The failure details are in the Worker logs.";
+      "I couldn't get a usable response from the configured providers this time. Please retry once; ask me 'Give exact error' for the latest saved diagnostic.";
     await sendUserReply(env, message, text, message.id, alert?.targets || null);
   }
   } finally {
