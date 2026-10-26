@@ -52,8 +52,9 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-26-r44";
+const CONVY_BUILD_VERSION = "convx-2026-10-26-r45";
 const CONVY_CURRENT_RELEASE_NOTES = [
+  "Preserve underlying provider diagnostics when profile-picture inspection fails instead of overwriting them with the generic user-facing error.",
   "Fix nested Gateway self-calls from inside the Durable Object by dispatching control routes directly, preventing the observed D1 subrequest-depth failure during replies.",
   "Add an opt-in Groq Qwen 3.8 27B vision fallback for image requests; it stays disabled by default to avoid unexpected metered inference charges.",
   "Automatically inspect a member's own public Discord avatar/banner when they ask how their PFP looks.",
@@ -3580,7 +3581,9 @@ async function handleMention(env, message) {
       const answer = await generateAnswer(env, env.DB, prompt, message.channel_id, message, { profileInspection });
       await sendUserReply(env, message, answer, message.id);
     } catch (error) {
-      await saveLatestModelFailure(env, error?.message || error, "profile_inspection");
+      // Preserve the real provider diagnostic attached by callFreeModel. The user-facing
+      // generic error is useful for chat, but must never overwrite the underlying cause.
+      await saveLatestModelFailure(env, error?.diagnosticDetail || error?.message || error, "profile_inspection");
       await sendUserReply(env, message, "I couldn't inspect your profile picture this time. Retry once, or ask me 'Give exact error' for the latest provider diagnostic.", message.id);
     }
     return;
