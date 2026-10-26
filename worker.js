@@ -2826,91 +2826,126 @@ async function callCompatibleFallback(env, db, messages, maxTokens, provider, mo
 
 async function callFreeModel(env, db, messages, maxTokens = 550) {
   const provider = configuredPrimaryProvider(env);
-  const selectedOverride = await setting(db, "owner_selected_model_id");
+  const selectedOverride = String(await safeSetting(db, "owner_selected_model_id", "") || "").trim();
   const hasImages = messages.some(message =>
     Array.isArray(message.content) && message.content.some(part => part?.type === "image_url")
   );
 
-  // Manual model choices and image requests retain their existing Pollinations route.
-  if (provider === "openrouter" && !selectedOverride && !hasImages) {
+  // Use Groq Qwen for image requests when available, so Pollinations is not the single point of failure.
+  if (hasImages) {
+    const failures = [];
+    const preferPollinationsVision = Boolean(selectedOverride && VISION_MODEL_IDS.has(selectedOverride));
+    if (preferPollinationsVision) {
+      try { return await callPollinationsModel(env, db, messages, maxTokens); }
+      catch (error) { failures.push("Selected Pollinations vision route: " + safeProviderDiagnostic(error?.message || error, 240)); }
+    }
+    if (env.GROQ_API_KEY) {
+      for (const item of configuredGroqFallbackModels(env).filter(candidate => GROQ_VISION_MODEL_IDS.has(candidate.modelId))) {
+        try {
+          return await callCompatibleFallback(env, db, messages, maxTokens, "groq", item.modelId, item.defaultReasoning);
+        } catch (error) {
+          const detail = safeProviderDiagnostic(error?.message || error, 240);
+          failures.push("Groq vision " + item.modelId + ": " + detail);
+          console.log("Groq vision fallback failed (" + item.modelId + "): " + detail);
+        }
+      }
+    } else {
+      failures.push("Groq vision: GROQ_API_KEY is not configured");
+    }
+    if (!preferPollinationsVision) {
+      try { return await callPollinationsModel(env, db, messages, maxTokens); }
+      catch (error) { failures.push("Pollinations vision: " + safeProviderDiagnostic(error?.message || error, 240)); }
+    }
+    const detail = failures.join("; ") || "No configured vision-capable model was available.";
+    await saveLatestModelFailure(env, detail, "vision_inference");
+    const failure = new Error("I couldn't analyze that image right now. Please retry shortly.");
+    failure.diagnosticDetail = detail;
+    throw failure;
+  }
+
+  if (provider === "openrouter") {
     const primaryId = configuredOpenRouterModel(env);
     let primaryError = "";
     const fallbackErrors = [];
-
-    if (!env.OPENROUTER_API_KEY) {
+    if (selectedOverride) {
+      try { return await callPollinationsModel(env, db, messages, maxTokens); }
+      catch (error) {
+        primaryError = "Manual Pollinations override " + selectedOverride + " failed: " +
+          safeProviderDiagnostic(error?.message || error, 240);
+        fallbackErrors.push(primaryError);
+        console.log("Manual Pollinations override failed; falling through to automatic providers: " + primaryError);
+      }
+    } else if (!env.OPENROUTER_API_KEY) {
       primaryError = "OPENROUTER_API_KEY is missing";
       console.log("OpenRouter primary unavailable: " + primaryError);
     } else {
-      try {
-        return await callOpenRouterPrimary(env, db, messages, maxTokens);
-      } catch (error) {
-        primaryError = openRouterErrorDetail(error?.message || error);
-        console.log("OpenRouter LFM failed; skipping all other OpenRouter models and moving to external fallbacks: " + primaryError);
+      try { return await callOpenRouterPrimary(env, db, messages, maxTokens); }
+      catch (error) {
+        primaryError = safeProviderDiagnostic(error?.message || error, 240);
+        fallbackErrors.push("OpenRouter " + primaryId + ": " + primaryError);
+        console.log("OpenRouter LFM failed; moving to external fallbacks: " + primaryError);
       }
-      // Deliberately do not try any other OpenRouter model: keep the shared free quota for LFM only.
     }
 
-    // Groq order is deliberate: inexpensive non-reasoning Qwen first, then low-effort GPT-OSS.
+    // Always continue through the remaining providers if a single fallback hits a rate limit.
     if (env.GROQ_API_KEY) {
       for (const item of configuredGroqFallbackModels(env)) {
         try {
-          const fallback = await callCompatibleFallback(
-            env, db, messages, maxTokens, "groq", item.modelId, item.defaultReasoning
-          );
-          return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
+          const fallback = await callCompatibleFallback(env, db, messages, maxTokens, "groq", item.modelId, item.defaultReasoning);
+          return { ...fallback, fallbackFrom: selectedOverride ? "pollinations-override/" + selectedOverride : "openrouter/" + primaryId };
         } catch (error) {
-          const detail = openRouterErrorDetail(error?.message || error);
+          const detail = safeProviderDiagnostic(error?.message || error, 240);
           fallbackErrors.push("Groq " + item.modelId + ": " + detail);
           console.log("Groq fallback failed (" + item.modelId + "): " + detail);
         }
       }
     } else {
       fallbackErrors.push("Groq: GROQ_API_KEY is not configured");
-      console.log("Groq fallbacks skipped: GROQ_API_KEY is not configured.");
     }
 
-    // Mistral is intentionally after all Groq candidates; it is attempted only when its key exists.
     if (env.MISTRAL_API_KEY) {
       const mistralModel = configuredMistralModel(env);
       try {
-        const fallback = await callCompatibleFallback(
-          env, db, messages, maxTokens, "mistral", mistralModel, ""
-        );
-        return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
+        const fallback = await callCompatibleFallback(env, db, messages, maxTokens, "mistral", mistralModel, "");
+        return { ...fallback, fallbackFrom: selectedOverride ? "pollinations-override/" + selectedOverride : "openrouter/" + primaryId };
       } catch (error) {
-        const detail = openRouterErrorDetail(error?.message || error);
+        const detail = safeProviderDiagnostic(error?.message || error, 240);
         fallbackErrors.push("Mistral " + mistralModel + ": " + detail);
         console.log("Mistral fallback failed (" + mistralModel + "): " + detail);
       }
     } else {
       fallbackErrors.push("Mistral: MISTRAL_API_KEY is not configured");
-      console.log("Mistral fallback skipped: MISTRAL_API_KEY is not configured.");
     }
 
-    try {
-      const fallback = await callPollinationsModel(env, db, messages, maxTokens);
-      return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
-    } catch (error) {
-      const pollinationsError = openRouterErrorDetail(error?.message || error);
-      fallbackErrors.push("Pollinations: " + pollinationsError);
-      const detail = "Primary " + primaryId + ": " + (primaryError || "unavailable") +
-        "; " + fallbackErrors.join("; ");
-      console.log(JSON.stringify({
-        event: "model_stack_failure",
-        provider: "openrouter",
-        model: primaryId,
-        detail: detail.slice(0, 1000)
-      }));
-      throw new Error("No configured text provider is responding right now. Please retry shortly.");
+    // Pollinations stays last unless the user explicitly selected a Pollinations override,
+    // in which case we already attempted it above.
+    if (!selectedOverride) {
+      try {
+        const fallback = await callPollinationsModel(env, db, messages, maxTokens);
+        return { ...fallback, fallbackFrom: "openrouter/" + primaryId };
+      } catch (error) {
+        fallbackErrors.push("Pollinations: " + safeProviderDiagnostic(error?.message || error, 240));
+      }
     }
+    const detail = "Primary " + primaryId + ": " + (primaryError || "unavailable") + "; " + fallbackErrors.join("; ");
+    console.log(JSON.stringify({ event: "model_stack_failure", provider: "openrouter", model: primaryId, detail: detail.slice(0, 1600) }));
+    await saveLatestModelFailure(env, detail, "text_inference");
+    const failure = new Error("No configured text provider is responding right now. Please retry shortly.");
+    failure.diagnosticDetail = detail;
+    throw failure;
   }
 
-  if (provider !== "openrouter" && provider !== "pollinations") {
+  if (provider !== "pollinations") {
     console.log("Unknown PRIMARY_MODEL_PROVIDER value; using the existing Pollinations route. provider=" + provider.slice(0, 40));
   }
-  return callPollinationsModel(env, db, messages, maxTokens);
+  try { return await callPollinationsModel(env, db, messages, maxTokens); }
+  catch (error) {
+    const detail = safeProviderDiagnostic(error?.message || error, 1600);
+    await saveLatestModelFailure(env, detail, "pollinations_inference");
+    if (!error.diagnosticDetail) error.diagnosticDetail = detail;
+    throw error;
+  }
 }
-
 async function fetchReferencedMessage(env, db, sourceMessage) {
   const reference = sourceMessage?.message_reference || sourceMessage?.reference || null;
   if (!reference?.message_id) return null;
