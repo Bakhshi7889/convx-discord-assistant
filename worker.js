@@ -4466,6 +4466,22 @@ export class DiscordGateway extends DurableObject {
       await this.ctx.storage.put("model_catalog_snapshot", nextSnapshot);
       return json({ ok: true, updated: nextModels.some(model => String(model.model_id) === id) });
     }
+    if (path === "/models/last-error" && request.method === "GET") {
+      return json({ ok: true, error: await this.ctx.storage.get("model_last_error") || null });
+    }
+    if (path === "/models/last-error" && request.method === "POST") {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      const detail = safeProviderDiagnostic(body.detail || "", 1800);
+      if (!detail) return json({ ok: false, error: "An error detail is required." }, 400);
+      const failure = {
+        at: Math.max(0, Number(body.at) || Date.now()),
+        source: String(body.source || "inference").slice(0, 80),
+        detail
+      };
+      await this.ctx.storage.put("model_last_error", failure);
+      return json({ ok: true, error: failure });
+    }
     if (path === "/control/status") {
       return json({ ok: true, paused: Boolean(await this.ctx.storage.get("convx_paused")), changedAt: await this.ctx.storage.get("convx_pause_changed_at") || null });
     }
