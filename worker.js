@@ -4324,6 +4324,9 @@ export class DiscordGateway extends DurableObject {
     super(ctx, env);
     this.ctx = ctx;
     this.env = env;
+    this.gatewayEnv = new Proxy(env, {
+      get: (target, property) => property === "__CONVY_GATEWAY_INSTANCE" ? this : Reflect.get(target, property, target)
+    });
     this.socket = null;
     this.sequence = null;
     this.heartbeatTimer = null;
@@ -5003,10 +5006,10 @@ if (path === "/issues/draft/complete" && request.method === "POST") {
     this.channelActive.set(channelId, (this.channelActive.get(channelId) || 0) + 1);
     this.globalActiveRequests++;
     this.channelLastStartedAt.set(channelId, Date.now());
-    Promise.resolve().then(() => handleMention(this.env, item.message)).catch(async error => {
+    Promise.resolve().then(() => handleMention(this.gatewayEnv, item.message)).catch(async error => {
       const detail = String(error?.message || error).slice(0, 160);
       console.log("Queued mention handler failed (" + channelId + "): " + detail);
-      try { await postAdminAlert(this.env, this.env.DB, "mention-handler-failure", "A message handler failed; the queue will continue. " + detail); } catch {}
+      try { await postAdminAlert(this.gatewayEnv, this.env.DB, "mention-handler-failure", "A message handler failed; the queue will continue. " + detail); } catch {}
     }).finally(() => {
       item.resolve();
       const active = Math.max(0, (this.channelActive.get(channelId) || 1) - 1);
@@ -5067,7 +5070,7 @@ if (path === "/issues/draft/complete" && request.method === "POST") {
       const contentWithoutMention = String(message.content || "").replace(
         new RegExp("<@!?" + String(this.env.BOT_USER_ID || "") + ">"), ""
       ).trim();
-      if (isCreator(message) && /^!/.test(contentWithoutMention)) await handleMention(this.env, message);
+      if (isCreator(message) && /^!/.test(contentWithoutMention)) await handleMention(this.gatewayEnv, message);
       else await this.enqueueChannelMessage(message);
     } finally {
       this.inFlightMessages.delete(messageId);
