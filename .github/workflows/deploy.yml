@@ -21,6 +21,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Test context utilities
+        run: node --test tests/context-utils.test.mjs
       - name: Check Worker syntax
         run: node --check worker.js
       - name: Check deployment configuration
