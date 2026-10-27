@@ -3877,17 +3877,32 @@ async function handleMention(env, message) {
       await sendUserReply(env, message, "Context diagnostics are creator-only.", message.id);
       return;
     }
-    let items = [];
+    let durableItems = [];
     try {
       const recent = await gatewayControl(env, "/context/read?channel_id=" + encodeURIComponent(String(message.channel_id)));
-      if (Array.isArray(recent.messages)) items = recent.messages;
-    } catch {}
-    if (!items.length) {
-      const rows = await env.DB.prepare("SELECT message_id AS id,author_id,author_name,content,created_at FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT 14").bind(message.channel_id).all();
-      items = (rows.results || []).reverse();
+      if (Array.isArray(recent.messages)) durableItems = recent.messages;
+    } catch (error) {
+      console.log("!context durable read skipped: " + String(error.message || error).slice(0, 100));
     }
-    const transcript = items.map(row => "[" + row.created_at + "] " + (String(row.author_id) === String(env.BOT_USER_ID) ? "CONVY" : row.author_name) + ": " + String(row.content || "").slice(0, 190)).join("\n");
-    await sendUserReply(env, message, "**Recent context (" + items.length + " messages)**\n" + (transcript || "(none saved yet)"), message.id);
+    let d1Items = [];
+    try {
+      const rows = await env.DB.prepare("SELECT message_id AS id,author_id,author_name,content,created_at,message_url FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT 24").bind(message.channel_id).all();
+      d1Items = rows.results || [];
+    } catch (error) {
+      console.log("!context D1 read skipped: " + String(error.message || error).slice(0, 100));
+    }
+    const items = mergeRecentMessages(d1Items, durableItems, 12);
+    const timeZone = String(env.CONTEXT_TIMEZONE || "Asia/Kolkata").slice(0, 80);
+    const transcript = items.map(row => {
+      const authorId = String(row.author_id || "unknown");
+      const id = String(row.id || row.message_id || "unknown");
+      const speaker = authorId === String(env.BOT_USER_ID) ? "CONVY" : String(row.author_name || "Unknown Discord member");
+      const stamp = formatContextTimestamp(row.created_at || row.timestamp, timeZone);
+      const link = row.message_url ? "\\n<" + String(row.message_url) + ">" : "";
+      return "[" + stamp.local + " | UTC " + stamp.utc + "] **" + speaker + "** (Discord ID " + authorId + ", message " + id + ")\\n" +
+        String(row.content || "").slice(0, 180) + link;
+    }).join("\\n\\n");
+    await sendUserReply(env, message, "**Recent context (" + items.length + " messages, timezone " + timeZone + ")**\\n" + (transcript || "(none saved yet)"), message.id);
     return;
   }
   if (command === "!version") {
