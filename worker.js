@@ -3898,11 +3898,11 @@ async function handleMention(env, message) {
       const id = String(row.id || row.message_id || "unknown");
       const speaker = authorId === String(env.BOT_USER_ID) ? "CONVY" : String(row.author_name || "Unknown Discord member");
       const stamp = formatContextTimestamp(row.created_at || row.timestamp, timeZone);
-      const link = row.message_url ? "\\n<" + String(row.message_url) + ">" : "";
-      return "[" + stamp.local + " | UTC " + stamp.utc + "] **" + speaker + "** (Discord ID " + authorId + ", message " + id + ")\\n" +
+      const link = row.message_url ? "\n<" + String(row.message_url) + ">" : "";
+      return "[" + stamp.local + " | UTC " + stamp.utc + "] **" + speaker + "** (Discord ID " + authorId + ", message " + id + ")\n" +
         String(row.content || "").slice(0, 180) + link;
-    }).join("\\n\\n");
-    await sendUserReply(env, message, "**Recent context (" + items.length + " messages, timezone " + timeZone + ")**\\n" + (transcript || "(none saved yet)"), message.id);
+    }).join("\n\n");
+    await sendUserReply(env, message, "**Recent context (" + items.length + " messages, timezone " + timeZone + ")**\n" + (transcript || "(none saved yet)"), message.id);
     return;
   }
   if (command === "!version") {
