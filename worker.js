@@ -2873,11 +2873,21 @@ async function callCloudflareVisionFallback(env, messages) {
     const result = await env.AI.run(CLOUDFLARE_VISION_MODEL_ID, {
       task: "query",
       image,
-      question
+      question,
+      // Moondream's query task defaults to streaming. This path expects a final
+      // structured object, so explicitly disable streaming before reading answer.
+      stream: false,
+      reasoning: false,
+      max_tokens: 1024,
+      temperature: 0.2
     });
-    const answer = typeof result === "string"
-      ? result.trim()
-      : String(result?.response || result?.answer || result?.text || result?.description || "").trim();
+    const candidates = [
+      result?.answer, result?.response, result?.text, result?.description,
+      result?.result?.answer, result?.result?.response, result?.output?.answer
+    ];
+    const answer = (typeof result === "string"
+      ? result
+      : candidates.find(value => typeof value === "string" && value.trim()))?.trim() || "";
     if (!answer) throw new Error("Moondream returned an empty response.");
     console.log(JSON.stringify({
       event: "model_request",
@@ -3562,6 +3572,10 @@ async function handleMention(env, message) {
   const isReply = await isReplyToBot(env, message);
   const plainCreatorToggle = isCreator(message) && /^(?:!pause|!start|pause|stop|shut up|stop replying|stop responding|stop talking|be quiet|go quiet|mute yourself|start replying|resume replying|come back|you can talk again)(?: now)?$/i.test(String(message.content || "").trim());
   if (!isMention && !isReply && !plainCreatorToggle) return;
+  // The scheduler is the fallback when a Gateway event is missed or delayed.
+  // Persist the addressed input to short context on this path too; the DO deduplicates by ID.
+  try { await appendConversationMessage(env, message); }
+  catch (error) { console.log("Addressed-message context append skipped: " + String(error.message || error).slice(0, 100)); }
   const query = String(message.content || "").replace(mention, "").trim();
   const normalizedInput = normalize(query);
   const verifiedAdult = hasVerifiedAdultRole(message);
