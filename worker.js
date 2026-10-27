@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { formatContextTimestamp, mergeRecentMessages } from "./context-utils.mjs";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
@@ -53,12 +54,13 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-26-r46";
+const CONVY_BUILD_VERSION = "convx-2026-10-27-r47";
 const CONVY_CURRENT_RELEASE_NOTES = [
-  "Add Cloudflare Workers AI Moondream 3.1 as the final image fallback for OCR and basic visual questions when existing vision routes fail.",
+  "Add Cloudflare Workers AI Moondream 3.1 as the final image fallback; explicitly disable streaming so query results return as a complete answer object.",
+  "Merge Durable Object and D1 conversation history by Discord message ID, preserving author names, message links, and UTC plus local timestamps.",
   "Preserve underlying provider diagnostics when profile-picture inspection fails instead of overwriting them with the generic user-facing error.",
   "Fix nested Gateway self-calls from inside the Durable Object by dispatching control routes directly, preventing the observed D1 subrequest-depth failure during replies.",
-  "Add an opt-in Groq Qwen 3.8 27B vision fallback for image requests; it stays disabled by default to avoid unexpected metered inference charges.",
+  "Allow the Groq Qwen 3.8 27B vision fallback when GROQ_VISION_ENABLED=true; this deployment enables it, and image inference may be metered.",
   "Automatically inspect a member's own public Discord avatar/banner when they ask how their PFP looks.",
   "Save the latest provider failure separately from chat history and return it for creator requests such as 'Give exact error' or !last-error.",
   "Let inference continue with safe defaults when a nonessential D1 settings read fails.",
@@ -145,9 +147,12 @@ const CONVY_RELEASE_HISTORY = [
   }
 ];
 const CONVY_RELEASE_NOTES = [
-  "Add Cloudflare Workers AI Moondream 3.1 as the final image fallback for OCR and basic visual questions when existing vision routes fail.",
+  "Add Cloudflare Workers AI Moondream 3.1 as the final image fallback; explicitly disable streaming so query results return as a complete answer object.",
+  "Merge Durable Object and D1 conversation history by Discord message ID, preserving author names, message links, and UTC plus local timestamps.",
   "Fix nested Gateway self-calls in the Durable Object that can trigger D1 subrequest-depth errors during inference.",
-  "Add opt-in Groq Qwen 3.8 27B vision routing, but require explicit GROQ_VISION_ENABLED=true because provider inference may be metered; inspect a user's own Discord avatar for natural PFP questions.",
+  "Route image requests through Groq Qwen 3.8 27B when GROQ_VISION_ENABLED=true; this deployment enables it and inference may be metered; inspect a user's own Discord avatar for natural PFP questions.",
+  "Merge durable short-term context with D1 history so missed Gateway events do not erase messages; expose UTC and configured local time alongside names, IDs, and message links.",
+  "Disable streaming for the Moondream query fallback and parse the documented answer field to avoid treating a streaming response as an empty result.",
   "Persist the latest provider failure and answer exact-error requests from live diagnostics rather than old chat history.",
   "Use safe defaults for nonessential settings reads so temporary D1 errors do not automatically abort model routing.",
   "Add a last-resort correction for identity questions when the generated reply impersonates a member or attributes an unverified developer/owner role.",
