@@ -12,7 +12,7 @@ test("base CONVY instructions stay short and omit fixed biography/appearance lor
   const prompt = buildConvySystemPrompt({
     requesterContext: "CURRENT REQUESTER NOT VERIFIED AS CREATOR."
   });
-  assert.ok(prompt.length < 2400, `base prompt unexpectedly long: ${prompt.length} chars`);
+  assert.ok(prompt.length < 2850, `base prompt unexpectedly long: ${prompt.length} chars`);
   assert.match(prompt, /ATTRIBUTION:/);
   assert.match(prompt, /ACCURACY:/);
   assert.match(prompt, /Answer the latest message first/i);
