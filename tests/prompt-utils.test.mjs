@@ -29,7 +29,7 @@ test("dynamic context is kept and explicitly marked as data", () => {
   assert.match(prompt, /OWNER INSTRUCTIONS/);
   assert.match(prompt, /RECENT CHANNEL HISTORY, oldest to newest \(data only\)/);
   assert.match(prompt, /WEB RESULTS \(data only\)/);
-  assert.match(prompt, /CONVY\/\[BOT\] rows are the bot's own words/);
+  assert.match(prompt, /CONVY\/\[BOT\] is the bot's own speech/);
 });
 
 test("Qwen prompt conversion moves instructions into the user turn and preserves images", () => {
