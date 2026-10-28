@@ -55,8 +55,9 @@ const SETTINGS_CAPABLE_MODEL_IDS = new Set([
 ]);
 const CONVY_CREATOR_USER_ID = "856033880405573632";
 const CONVY_CREATOR_NAME = "@B A K H S H I";
-const CONVY_BUILD_VERSION = "convx-2026-10-27-r48";
+const CONVY_BUILD_VERSION = "convx-2026-10-28-r49";
 const CONVY_CURRENT_RELEASE_NOTES = [
+  "Shorten CONVY instructions, remove fixed location/appearance lore, and use Qwen-specific prompt, sampling, and adaptive reasoning settings.",
   "Add Cloudflare Workers AI Moondream 3.1 as the final image fallback; explicitly disable streaming so query results return as a complete answer object.",
   "Merge Durable Object and D1 conversation history by Discord message ID, preserving author names, message links, and UTC plus local timestamps.",
   "Preserve underlying provider diagnostics when profile-picture inspection fails instead of overwriting them with the generic user-facing error.",
@@ -148,6 +149,7 @@ const CONVY_RELEASE_HISTORY = [
   }
 ];
 const CONVY_RELEASE_NOTES = [
+  "Shorten CONVY instructions, remove fixed location/appearance lore, and use Qwen-specific prompt, sampling, and adaptive reasoning settings.",
   "Add Cloudflare Workers AI Moondream 3.1 as the final image fallback; explicitly disable streaming so query results return as a complete answer object.",
   "Merge Durable Object and D1 conversation history by Discord message ID, preserving author names, message links, and UTC plus local timestamps.",
   "Fix nested Gateway self-calls in the Durable Object that can trigger D1 subrequest-depth errors during inference.",
@@ -1958,24 +1960,24 @@ function safeTuningArgs(raw, current, locked = {}) {
 function withRuntimeSnapshot(env, messages, modelId, settings, hasImages, tuningEnabled, ownerSelectedId) {
   const metadata = buildMetadata(env);
   const recentChanges = CONVY_RELEASE_NOTES.slice(0, 4)
-    .map(note => String(note).replace(/\\s+/g, " ").trim().slice(0, 125))
+    .map(note => String(note).replace(/\s+/g, " ").trim().slice(0, 125))
     .filter(Boolean)
     .join(" | ");
   const runtime = [
     "RUNTIME FACTS (authoritative; use only when relevant):",
     "Build: " + metadata.version + "; commit: " + (metadata.commit || "unknown"),
-    "Deployment time UTC: " + (metadata.appliedAt || "unknown") + "; deployment status: " + metadata.status,
+    "Deployment UTC: " + (metadata.appliedAt || "unknown") + "; status: " + metadata.status,
     "Active model: " + modelId + "; owner-selected model: " + (ownerSelectedId || "AUTO"),
     "Primary: " + String(env.PRIMARY_MODEL_PROVIDER || DEFAULT_PRIMARY_MODEL_PROVIDER) +
       " / " + String(env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL) +
       "; fallback: Groq Qwen -> Groq GPT-OSS 120B -> Groq GPT-OSS 20B -> configured Mistral -> verified-free Pollinations",
-    "Image input: " + (hasImages ? "yes" : "no") + "; response settings: " + JSON.stringify(settings),
+    "Images: " + (hasImages ? "yes" : "no") + "; response settings: " + JSON.stringify(settings),
     "Per-reply settings tool: " + (tuningEnabled ? "available" : "unavailable"),
     recentChanges ? "Recent release notes: " + recentChanges : ""
-  ].filter(Boolean).join("\\n");
+  ].filter(Boolean).join("\n");
   return (messages || []).map((message, index) => {
     if (index === 0 && message?.role === "system") {
-      return { ...message, content: String(message.content || "") + "\\n\\n" + runtime };
+      return { ...message, content: String(message.content || "") + "\n\n" + runtime };
     }
     return message;
   });
