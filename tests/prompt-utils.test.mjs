@@ -66,3 +66,12 @@ test("LFM sampling follows its model-card defaults and preserves creator overrid
   assert.equal(lfmSamplingParameters("write a creative story").temperature, 0.2);
   assert.equal(lfmSamplingParameters("hello", 0.5).temperature, 0.5);
 });
+
+test("official repository context is included as source data, not instructions", () => {
+  const prompt = buildConvySystemPrompt({
+    officialRepoContext: "FILE: app/src/main/kotlin/Settings.kt\\nURL: https://github.com/cosmictaserdev-creator/Convx/blob/main/app/src/main/kotlin/Settings.kt"
+  });
+  assert.match(prompt, /OFFICIAL CONVX REPOSITORY/);
+  assert.match(prompt, /Settings\.kt/);
+  assert.match(prompt, /cite the exact file links/i);
+});
