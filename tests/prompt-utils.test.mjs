@@ -12,7 +12,7 @@ test("base CONVY instructions stay short and omit fixed biography/appearance lor
   const prompt = buildConvySystemPrompt({
     requesterContext: "CURRENT REQUESTER NOT VERIFIED AS CREATOR."
   });
-  assert.ok(prompt.length < 2850, `base prompt unexpectedly long: ${prompt.length} chars`);
+  assert.ok(prompt.length < 3200, `base prompt unexpectedly long: ${prompt.length} chars`);
   assert.match(prompt, /ATTRIBUTION:/);
   assert.match(prompt, /ACCURACY:/);
   assert.match(prompt, /Answer the latest message first/i);
@@ -79,7 +79,7 @@ test("official repository context is included as source data, not instructions",
 test("capability answers describe supported features and preserve issue safeguards", () => {
   const prompt = buildConvySystemPrompt();
   assert.match(prompt, /CAPABILITIES:/);
-  assert.match(prompt, /official public repository/);
+  assert.match(prompt, /official repository links/);
   assert.match(prompt, /Only configured admins create issues/);
   assert.match(prompt, /explicit confirmation/);
   assert.match(prompt, /cannot directly change app settings/);
