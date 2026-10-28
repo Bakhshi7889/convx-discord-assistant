@@ -4,7 +4,8 @@ import {
   buildConvySystemPrompt,
   moveSystemPromptToUserMessage,
   selectQwenReasoningEffort,
-  qwenSamplingParameters
+  qwenSamplingParameters,
+  lfmSamplingParameters
 } from "../prompt-utils.mjs";
 
 test("base CONVY instructions stay short and omit fixed biography/appearance lore", () => {
@@ -56,4 +57,12 @@ test("Qwen sampling follows the documented instruct/thinking modes and respects 
   assert.deepEqual(qwenSamplingParameters("none"), { temperature: 0.7, top_p: 0.8 });
   assert.deepEqual(qwenSamplingParameters("medium"), { temperature: 1.0, top_p: 0.95 });
   assert.deepEqual(qwenSamplingParameters("none", 0.4), { temperature: 0.4, top_p: 0.8 });
+});
+
+test("LFM sampling follows its model-card defaults and preserves creator overrides", () => {
+  assert.deepEqual(lfmSamplingParameters("hello"), {
+    temperature: 0.1, top_k: 50, repetition_penalty: 1.1
+  });
+  assert.equal(lfmSamplingParameters("write a creative story").temperature, 0.2);
+  assert.equal(lfmSamplingParameters("hello", 0.5).temperature, 0.5);
 });
