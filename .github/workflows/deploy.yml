@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: "22"
       - name: Test context utilities
-        run: node --test tests/context-utils.test.mjs
+        run: node --test tests/*.test.mjs
       - name: Check Worker syntax
         run: node --check worker.js
       - name: Check deployment configuration
