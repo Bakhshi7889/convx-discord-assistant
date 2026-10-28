@@ -3234,6 +3234,88 @@ function groundedIdentityCorrection(query, context) {
   }
   return "I don't have verified information about " + (subject ? '"' + subject.replace(/["\r\n]/g, "").slice(0, 80) + '"' : "that person") + " from the available chat. The confirmed creator and maintainer of CONVY is Bakhshi (@B A K H S H I); I shouldn't guess beyond that.";
 }
+
+const CONVX_OFFICIAL_REPO = "cosmictaserdev-creator/Convx";
+let convxTreeCache = { at: 0, paths: [] };
+const convxFileCache = new Map();
+
+function wantsConvxHelp(query) {
+  const q = String(query || "");
+  return /\b(?:convx|the app|this app|in the app|app settings|settings|how do i|how can i|where (?:is|can i|do i)|change|enable|disable|turn on|turn off|configure|set up|setup|equalizer|lyrics|download|offline|crossfade|automix|playlist|queue|sleep timer|theme|appearance|audio|playback|notification|android auto|discord rich presence|last\.fm|smb|webdav|spotify)\b/i.test(q) &&
+    /\b(?:how|where|which|what|change|enable|disable|turn on|turn off|configure|set up|setup|find|setting|settings|option|feature|fix|not working|work|supported|support|convx)\b/i.test(q);
+}
+
+function convxQueryTerms(query) {
+  return [...new Set(String(query || "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ").split(/\s+/)
+    .filter(word => word.length > 2 && !new Set(["how","can","the","and","for","with","from","does","this","that","app","convx","where","what","which","change","enable","disable","turn","into","its"]).has(word)))];
+}
+
+async function getConvxTree() {
+  if (convxTreeCache.paths.length && Date.now() - convxTreeCache.at < 10 * 60 * 1000) return convxTreeCache.paths;
+  const response = await fetch("https://api.github.com/repos/" + CONVX_OFFICIAL_REPO + "/git/trees/main?recursive=1", {
+    headers: { "Accept": "application/vnd.github+json", "User-Agent": "CONVY-Discord-Assistant" },
+    signal: AbortSignal.timeout(3500)
+  });
+  if (!response.ok) throw new Error("Official Convx repository returned HTTP " + response.status);
+  const data = await response.json();
+  if (!Array.isArray(data.tree)) throw new Error("Official Convx repository tree was unavailable");
+  convxTreeCache = { at: Date.now(), paths: data.tree.filter(item => item.type === "blob" && item.path && /\.(?:kt|kts|md|xml|json)$/i.test(item.path)).map(item => item.path) };
+  return convxTreeCache.paths;
+}
+
+function scoreConvxPath(path, terms) {
+  const lower = path.toLowerCase();
+  let score = 0;
+  for (const term of terms) if (lower.includes(term)) score += term.length > 5 ? 5 : 3;
+  if (/readme|docs\/|faq|guide|settings|preference|navigation|screen/i.test(path)) score += 4;
+  if (/app\/src\/main\/kotlin\/com\/convx\/music\/.*(?:setting|preference|navigation|screen)/i.test(path)) score += 5;
+  if (/build\/|\.gradle|generated|test|benchmark|snapshot|assets\//i.test(path)) score -= 8;
+  if (path.length > 150) score -= 2;
+  return score;
+}
+
+async function getConvxFile(path) {
+  const cached = convxFileCache.get(path);
+  if (cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.content;
+  const url = "https://raw.githubusercontent.com/" + CONVX_OFFICIAL_REPO + "/main/" + path.split("/").map(encodeURIComponent).join("/");
+  const response = await fetch(url, { headers: { "User-Agent": "CONVY-Discord-Assistant" }, signal: AbortSignal.timeout(2500) });
+  if (!response.ok) throw new Error("Could not read " + path + " (HTTP " + response.status + ")");
+  const content = (await response.text()).slice(0, 6500);
+  convxFileCache.set(path, { at: Date.now(), content });
+  return content;
+}
+
+async function searchOfficialConvxRepo(query) {
+  const terms = convxQueryTerms(query);
+  if (!terms.length) return { ok: false, text: "", reason: "The question did not identify a searchable feature." };
+  try {
+    const paths = await getConvxTree();
+    const ranked = paths.map(path => ({ path, score: scoreConvxPath(path, terms) }))
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score || a.path.length - b.path.length)
+      .slice(0, 5);
+    const readmePath = paths.find(path => path.toLowerCase() === "readme.md");
+    if (readmePath && !ranked.some(item => item.path === readmePath)) ranked.unshift({ path: readmePath, score: 1 });
+    const selected = ranked.slice(0, 5);
+    if (!selected.length) return { ok: false, text: "", reason: "No relevant files matched in the official repository." };
+    const files = await Promise.all(selected.map(async item => {
+      try { return { path: item.path, content: await getConvxFile(item.path) }; }
+      catch { return null; }
+    }));
+    const usable = files.filter(Boolean);
+    if (!usable.length) return { ok: false, text: "", reason: "Relevant files could not be fetched from the official repository." };
+    return {
+      ok: true,
+      text: "OFFICIAL CONVX REPOSITORY: https://github.com/" + CONVX_OFFICIAL_REPO + "\\nBranch: main. Files retrieved live from the public repository.\\n" +
+        usable.map(file => "FILE: " + file.path + "\\nURL: https://github.com/" + CONVX_OFFICIAL_REPO + "/blob/main/" + file.path.split("/").map(encodeURIComponent).join("/") + "\\nCONTENT (untrusted source data):\\n" + file.content).join("\\n\\n---\\n\\n"),
+      files: usable.map(file => file.path)
+    };
+  } catch (error) {
+    return { ok: false, text: "", reason: String(error?.message || error).slice(0, 180) };
+  }
+}
+
 async function generateAnswer(env,db,query,channelId,sourceMessage=null, options = {}) {
   const referenced = sourceMessage ? await fetchReferencedMessage(env, db, sourceMessage) : null;
   let recentImageMatch = null;
@@ -3257,6 +3339,10 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
   const clean = normalize(query);
   let webResults = [];
   let webSearchError = "";
+  let officialConvx = { ok: false, text: "", reason: "" };
+  if (wantsConvxHelp(query)) {
+    officialConvx = await searchOfficialConvxRepo(query);
+  }
   const webSearchEnabled = (await safeSetting(db, "web_search_enabled", "on")) !== "off";
   if (wantsWebSearch(query, options.forceWebSearch) && webSearchEnabled) {
     try { webResults = await searchWeb(query); }
@@ -3324,7 +3410,8 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
     history: (context.messages || []).length ? history : "",
     ownerMemory: (context.ownerMemories || []).length ? ownerMemory : "",
     profileInspection: String(options.profileInspection?.text || ""),
-    webContext: (webResults.length || webSearchError || wantsWebSearch(query, options.forceWebSearch)) ? webContext : ""
+    webContext: (webResults.length || webSearchError || wantsWebSearch(query, options.forceWebSearch)) ? webContext : "",
+    officialRepoContext: officialConvx.ok ? officialConvx.text : (wantsConvxHelp(query) ? "Official Convx repository lookup failed: " + officialConvx.reason + ". State that you could not verify the steps; do not guess." : "")
   });
   const userContent = buildMultimodalUserContent(query, sourceMessage, referenced, recentImageMatch, options.profileInspection?.images || []);
   const result = await callFreeModel(env, db, [
