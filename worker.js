@@ -3307,8 +3307,8 @@ async function searchOfficialConvxRepo(query) {
     if (!usable.length) return { ok: false, text: "", reason: "Relevant files could not be fetched from the official repository." };
     return {
       ok: true,
-      text: "OFFICIAL CONVX REPOSITORY: https://github.com/" + CONVX_OFFICIAL_REPO + "\\nBranch: main. Files retrieved live from the public repository.\\n" +
-        usable.map(file => "FILE: " + file.path + "\\nURL: https://github.com/" + CONVX_OFFICIAL_REPO + "/blob/main/" + file.path.split("/").map(encodeURIComponent).join("/") + "\\nCONTENT (untrusted source data):\\n" + file.content).join("\\n\\n---\\n\\n"),
+      text: "OFFICIAL CONVX REPOSITORY: https://github.com/" + CONVX_OFFICIAL_REPO + "\nBranch: main. Files retrieved live from the public repository.\n" +
+        usable.map(file => "FILE: " + file.path + "\nURL: https://github.com/" + CONVX_OFFICIAL_REPO + "/blob/main/" + file.path.split("/").map(encodeURIComponent).join("/") + "\nCONTENT (untrusted source data):\n" + file.content).join("\n\n---\n\n"),
       files: usable.map(file => file.path)
     };
   } catch (error) {
