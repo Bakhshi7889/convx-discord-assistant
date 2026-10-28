@@ -156,3 +156,8 @@ Each push to `main` runs:
 3. Deployment to the connected Cloudflare account, with `BUILD_VERSION`, `BUILD_COMMIT`, `BUILD_COMMIT_AT`, `BUILD_APPLIED_AT`, and the GitHub Actions run URL injected into Worker variables. `BUILD_APPLIED_AT` is recorded immediately before the deployment command; it is the deployment start timestamp, not an exact completion timestamp.
 
 Do not put Discord tokens, Pollinations keys, or Cloudflare API tokens in the repository. GitHub Actions uses repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` for deployment.
+
+
+## Official Convx repository answers in CONVY
+
+For questions that appear to ask how to use or configure Convx, CONVY attempts a live, read-only lookup against the official public repository `cosmictaserdev-creator/Convx`. It reads the repository file tree, ranks likely relevant files, and supplies a small set of source files and links to the model. Answers should cite those links and distinguish verified instructions from inference. If GitHub is unavailable or the files do not establish the answer, CONVY should say it could not verify the steps instead of inventing a menu path. This is read-only; no GitHub write token is required for the public repository.
