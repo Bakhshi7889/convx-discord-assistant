@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { formatContextTimestamp, mergeRecentMessages } from "./context-utils.mjs";
 import { buildConvySystemPrompt, moveSystemPromptToUserMessage, selectQwenReasoningEffort, qwenSamplingParameters, lfmSamplingParameters } from "./prompt-utils.mjs";
+import { normalizeIssueSearchResults, normalizeCreatedIssue, normalizeCreatedComment } from "./issue-utils.mjs";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
@@ -734,12 +735,7 @@ async function searchConvxIssueDuplicates(env, title) {
   const terms = words.length ? words.join(" ") : '"' + String(title).replace(/"/g, "").slice(0, 100) + '"';
   const query = "repo:" + CONVY_ISSUES_REPOSITORY + " is:issue is:open " + terms;
   const payload = await githubIssuesRequest(env, "/search/issues?q=" + encodeURIComponent(query) + "&per_page=5", { method: "GET" });
-  return (Array.isArray(payload?.items) ? payload.items : []).slice(0, 3).map(item => ({
-    number: Number(item.number) || 0,
-    title: String(item.title || "Untitled issue").slice(0, 180),
-    html_url: String(item.html_url || ""),
-    state: String(item.state || "open")
-  })).filter(item => item.number > 0 && item.html_url);
+  return normalizeIssueSearchResults(payload, CONVY_ISSUES_REPOSITORY);
 }
 async function createConvxIssueSlashCommand(env) {
   if (!env.DISCORD_TOKEN || !env.BOT_USER_ID || !env.GUILD_ID) throw new Error("Discord bot, application, and guild configuration are required.");
@@ -834,7 +830,17 @@ async function confirmConvxIssue(env, interaction, draftId) {
     const draftLookup = await gatewayControl(env,
       "/issues/draft?draft_id=" + encodeURIComponent(draftId) + "&user_id=" + encodeURIComponent(userId));
     if (!draftLookup?.draft) throw new Error("Issue draft is no longer available.");
-    const freshDuplicates = await searchConvxIssueDuplicates(env, draftLookup.draft.title);
+    let freshDuplicates;
+    try {
+      freshDuplicates = await searchConvxIssueDuplicates(env, draftLookup.draft.title);
+    } catch (error) {
+      await editDiscordInteractionResponse(interaction, {
+        content: "I couldn't re-check existing Convx issues, so I did not create anything. Please prepare or confirm the issue again only after GitHub search is working.",
+        components: []
+      }).catch(() => {});
+      console.log("Slash issue duplicate re-check failed: " + String(error?.message || error).slice(0, 180));
+      return;
+    }
     if (freshDuplicates.length) {
       await gatewayControl(env, "/issues/draft/cancel", {
         method: "POST",
@@ -862,15 +868,29 @@ async function confirmConvxIssue(env, interaction, draftId) {
       method: "POST",
       body: JSON.stringify({ title: draft.title, body: issueBody })
     });
+    let created;
+    try {
+      created = normalizeCreatedIssue(result, CONVY_ISSUES_REPOSITORY);
+    } catch (error) {
+      await gatewayControl(env, "/issues/draft/cancel", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ draftId, userId })
+      }).catch(() => {});
+      await editDiscordInteractionResponse(interaction, {
+        content: "GitHub accepted the request but didn't return a verifiable issue number and link. Check the [Convx issues list](https://github.com/" + CONVY_ISSUES_REPOSITORY + "/issues) before retrying.",
+        components: []
+      }).catch(() => {});
+      console.log("Slash issue response could not be verified: " + String(error?.message || error).slice(0, 180));
+      return;
+    }
     await gatewayControl(env, "/issues/draft/complete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ draftId, userId, issueNumber: Number(result.number) || 0, issueUrl: String(result.html_url || "") })
+      body: JSON.stringify({ draftId, userId, issueNumber: created.number, issueUrl: created.url })
     }).catch(() => {});
     await editDiscordInteractionResponse(interaction, {
-      content: "Created [#" + result.number + " " + String(result.title || draft.title).slice(0, 160) + "](" + result.html_url + ") in Convx.",
+      content: "Created [#" + created.number + " " + created.title + "](" + created.url + ") in Convx.",
       components: []
-    });
+    }).catch(() => {});
   } catch (error) {
     const detail = String(error.message || error);
     const content = detail.includes("rate limited")
@@ -1113,7 +1133,16 @@ async function createIssueFromConversation(env, message) {
     const preflight = latest?.state;
     if (!preflight || preflight.stage !== "awaiting_create_confirmation") throw new Error("This issue draft expired.");
     if (!preflight.allowDuplicateOverride) {
-      const duplicates = await searchConvxIssueDuplicates(env, preflight.title);
+      let duplicates;
+      try {
+        duplicates = await searchConvxIssueDuplicates(env, preflight.title);
+      } catch (error) {
+        await sendUserReply(env, message,
+          "I couldn't re-check existing Convx issues before submission, so I did not create anything. The draft is still here; retry only when GitHub search is working.",
+          message.id).catch(() => {});
+        console.log("Convx duplicate re-check failed: " + String(error?.message || error).slice(0, 180));
+        return;
+      }
       if (duplicates.length) {
         preflight.duplicates = duplicates;
         preflight.stage = "awaiting_choice";
@@ -1138,8 +1167,25 @@ async function createIssueFromConversation(env, message) {
       method: "POST",
       body: JSON.stringify({ title: state.title, body: issueBody })
     });
-    await clearIssueConversation(env, channelId, userId);
-    await sendUserReply(env, message, "Created [#" + result.number + " " + String(result.title || state.title).slice(0, 160) + "](" + result.html_url + ") in Convx.", message.id);
+    let created;
+    try {
+      created = normalizeCreatedIssue(result, CONVY_ISSUES_REPOSITORY);
+    } catch (error) {
+      // A successful POST may already have created the issue. Never leave a retryable draft
+      // when the response cannot be verified, or a second confirmation could create a duplicate.
+      didClaim = false;
+      await clearIssueConversation(env, channelId, userId).catch(() => {});
+      await sendUserReply(env, message,
+        "GitHub accepted the request but didn't return a verifiable issue number and link. I can't safely confirm the result. Check the [Convx issues list](https://github.com/" + CONVY_ISSUES_REPOSITORY + "/issues) before retrying.",
+        message.id).catch(() => {});
+      console.log("Convx issue response could not be verified: " + String(error?.message || error).slice(0, 180));
+      return;
+    }
+    // From this point GitHub's successful response is verified. Storage or Discord reply
+    // failures must not turn a successful create into an invitation to retry.
+    didClaim = false;
+    await clearIssueConversation(env, channelId, userId).catch(() => {});
+    await sendUserReply(env, message, "Created [#" + created.number + " " + created.title + "](" + created.url + ") in Convx.", message.id).catch(() => {});
   } catch (error) {
     const detail = String(error.message || error);
     if (didClaim) await gatewayControl(env, "/issues/conversation/reset", {
@@ -1166,7 +1212,21 @@ async function addCommentFromConversation(env, message, state) {
     didClaim = true;
     const draft = claim.state;
     const issue = await verifyConvxIssue(env, draft.commentIssueNumber);
-    const duplicate = await findDuplicateConvxComment(env, issue.number, draft.commentText);
+    let duplicate;
+    try {
+      duplicate = await findDuplicateConvxComment(env, issue.number, draft.commentText);
+    } catch (error) {
+      if (didClaim) await gatewayControl(env, "/issues/conversation/reset", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channelId, userId, action: "comment" })
+      }).catch(() => {});
+      didClaim = false;
+      await sendUserReply(env, message,
+        "I couldn't verify whether this exact comment already exists, so I didn't post it. Please try again after GitHub's comment list is available.",
+        message.id).catch(() => {});
+      console.log("Convx duplicate-comment check failed: " + String(error?.message || error).slice(0, 180));
+      return;
+    }
     if (duplicate) {
       await clearIssueConversation(env, channelId, userId);
       await sendUserReply(env, message,
@@ -1181,8 +1241,21 @@ async function addCommentFromConversation(env, message, state) {
         body: JSON.stringify({ body: String(draft.commentText || "").slice(0, 4000) +
           "\n\n*Comment added via CONVY by " + reporter + " (Discord user ID: " + userId + ").*" })
       });
-    await clearIssueConversation(env, channelId, userId);
-    await sendUserReply(env, message, "Added your update to [#" + issue.number + " " + issue.title + "](" + issue.html_url + "). [View comment](" + result.html_url + ")", message.id);
+    let createdComment;
+    try {
+      createdComment = normalizeCreatedComment(result, CONVY_ISSUES_REPOSITORY, issue.number);
+    } catch (error) {
+      didClaim = false;
+      await clearIssueConversation(env, channelId, userId).catch(() => {});
+      await sendUserReply(env, message,
+        "GitHub accepted the comment request but didn't return a verifiable comment link. Check the [issue comments](" + issue.html_url + ") before retrying so I don't post it twice.",
+        message.id).catch(() => {});
+      console.log("Convx comment response could not be verified: " + String(error?.message || error).slice(0, 180));
+      return;
+    }
+    didClaim = false;
+    await clearIssueConversation(env, channelId, userId).catch(() => {});
+    await sendUserReply(env, message, "Added your update to [#" + issue.number + " " + issue.title + "](" + issue.html_url + "). [View comment](" + createdComment.url + ")", message.id).catch(() => {});
   } catch (error) {
     const detail = String(error.message || error);
     if (didClaim) await gatewayControl(env, "/issues/conversation/reset", {
