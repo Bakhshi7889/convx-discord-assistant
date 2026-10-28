@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { formatContextTimestamp, mergeRecentMessages } from "./context-utils.mjs";
-import { buildConvySystemPrompt, moveSystemPromptToUserMessage, selectQwenReasoningEffort, qwenSamplingParameters } from "./prompt-utils.mjs";
+import { buildConvySystemPrompt, moveSystemPromptToUserMessage, selectQwenReasoningEffort, qwenSamplingParameters, lfmSamplingParameters } from "./prompt-utils.mjs";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const POLLINATIONS_API = "https://gen.pollinations.ai";
@@ -2450,6 +2450,7 @@ async function openRouterCompletion(env, modelId, messages, settings, ownerSelec
     model: modelId,
     messages: requestMessages,
     temperature: settings.temperature,
+    ...(modelId.toLowerCase().startsWith("liquid/lfm-2.5-2.6b") ? { top_k: 50, repetition_penalty: 1.1 } : {}),
     max_tokens: settings.max_tokens,
     ...(useTools ? { tools: RESPONSE_SETTINGS_TOOL, tool_choice: "auto" } : {})
   };
@@ -2581,7 +2582,14 @@ async function callOpenRouterPrimary(env, db, messages, maxTokens = 550, modelId
     if (configuredMaxTokens !== null && configuredMaxTokens !== "" && Number.isInteger(Number(configuredMaxTokens)) && Number(configuredMaxTokens) >= 100 && Number(configuredMaxTokens) <= 900) lockedSettings.max_tokens = Number(configuredMaxTokens);
 
     const query = requestText(messages);
-    const initialSettings = { ...initialResponseSettings(query, maxTokens, false), ...lockedSettings };
+    const lfmSampling = modelId.toLowerCase().startsWith("liquid/lfm-2.5-2.6b")
+      ? lfmSamplingParameters(query, lockedSettings.temperature)
+      : null;
+    const initialSettings = {
+      ...initialResponseSettings(query, maxTokens, false),
+      ...lockedSettings,
+      ...(lfmSampling ? { temperature: lfmSampling.temperature } : {})
+    };
     const currentSettings = {
       temperature: initialSettings.temperature,
       max_tokens: initialSettings.max_tokens
