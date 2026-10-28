@@ -93,3 +93,19 @@ test("official repository context uses actual line breaks and citation guidance"
   assert.ok(prompt.includes("FILE: app/src/main/kotlin/Settings.kt\nURL:"));
   assert.match(prompt, /cite the exact file links/i);
 });
+
+test("capability answers avoid presenting general model skills as connected tools", () => {
+  const prompt = buildConvySystemPrompt();
+  assert.match(prompt, /Do not list generic model skills/);
+  assert.match(prompt, /Only configured admins can create new issues/);
+  assert.match(prompt, /cannot directly change app settings/);
+});
+
+test("official Convx help explicitly requests concise, source-grounded answers", () => {
+  const prompt = buildConvySystemPrompt({
+    officialRepoContext: "FILE: README.md\nURL: https://github.com/cosmictaserdev-creator/Convx/blob/main/README.md"
+  });
+  assert.match(prompt, /under about 100 words/);
+  assert.match(prompt, /at most 3 short bullets and 2 source links/);
+  assert.match(prompt, /Use exact UI labels or menu paths only when the files show them/);
+});
