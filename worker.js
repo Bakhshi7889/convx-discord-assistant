@@ -70,7 +70,7 @@ const CONVY_CURRENT_RELEASE_NOTES = [
   "Explain when !model is given an automatic OpenRouter/Groq/Mistral provider model instead of a Pollinations catalog choice; support !providers as an alias for !provider.",
   "Ground recent channel history in Discord author IDs and add stricter rules against impersonating members or inventing ownership/developer claims.",
   "Expand natural-language web-search detection to catch requests like finding a profile on the internet.",
-  "Add Groq fallback models in order: Qwen 3.8 27B with reasoning disabled, GPT-OSS 120B with low reasoning, then GPT-OSS 20B with low reasoning.",
+  "Add Groq fallback models in order: Qwen 3.8 27B with task-adaptive reasoning (none for casual chat, higher effort for complex tasks), GPT-OSS 120B with low reasoning, then GPT-OSS 20B with low reasoning.",
   "Add Ministral 14B as the next configurable Mistral fallback when MISTRAL_API_KEY is configured; retain Pollinations as the strict verified-free last resort.",
   "Keep OpenRouter pinned to the single configured LFM model; on failure, skip all other OpenRouter models and proceed to Groq, Mistral, then verified-free Pollinations.",
   "Preserve explicit model overrides, image routing, conversation memory, queues, diagnostics, and GitHub issue workflows."
@@ -3316,7 +3316,7 @@ async function generateAnswer(env,db,query,channelId,sourceMessage=null, options
     history: (context.messages || []).length ? history : "",
     ownerMemory: (context.ownerMemories || []).length ? ownerMemory : "",
     profileInspection: String(options.profileInspection?.text || ""),
-    webContext: (webResults.length || webSearchError) ? webContext : ""
+    webContext: (webResults.length || webSearchError || wantsWebSearch(query, options.forceWebSearch)) ? webContext : ""
   });
   const userContent = buildMultimodalUserContent(query, sourceMessage, referenced, recentImageMatch, options.profileInspection?.images || []);
   const result = await callFreeModel(env, db, [
