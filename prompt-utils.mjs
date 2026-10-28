@@ -97,7 +97,7 @@ export function selectQwenReasoningEffort(modelId, query, configured, fallback =
 }
 
 export function lfmSamplingParameters(query, temperatureOverride = null) {
-  const creative = /\\b(?:story|poem|creative|brainstorm|roleplay|invent|imagine)\\b/i.test(String(query || ""));
+  const creative = /\b(?:story|poem|creative|brainstorm|roleplay|invent|imagine)\b/i.test(String(query || ""));
   const overrideIsValid = temperatureOverride !== null &&
     temperatureOverride !== "" &&
     Number.isFinite(Number(temperatureOverride)) &&
