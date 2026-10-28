@@ -20,7 +20,7 @@ export function normalizeIssueSearchResults(payload, repository) {
     }
     if (item.pull_request) continue;
     const number = Number(item.number);
-    if (!item.html_url.startsWith(prefix)) {
+    if (item.html_url !== prefix + number) {
       throw new Error("GitHub duplicate search returned an issue outside the target repository.");
     }
     if (item.state.toLowerCase() !== "open") continue;
@@ -57,7 +57,7 @@ export function normalizeCreatedComment(payload, repository, issueNumber) {
     : "";
   if (!Number.isSafeInteger(number) || number < 1 ||
       !Number.isSafeInteger(id) || id < 1 ||
-      !/^\\d+$/.test(commentSuffix) || Number(commentSuffix) !== id) {
+      commentSuffix !== String(id)) {
     throw new Error("GitHub did not return a verifiable created comment.");
   }
   return { id, url: payload.html_url };
