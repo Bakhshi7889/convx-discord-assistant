@@ -14,7 +14,7 @@ test("base CONVY instructions stay short and omit fixed biography/appearance lor
   assert.ok(prompt.length < 2400, `base prompt unexpectedly long: ${prompt.length} chars`);
   assert.match(prompt, /ATTRIBUTION:/);
   assert.match(prompt, /ACCURACY:/);
-  assert.match(prompt, /newest message first/i);
+  assert.match(prompt, /Answer the latest message first/i);
   assert.doesNotMatch(prompt, /Bangalore|Bengaluru|Pune|birthday|beauty mark|166 cm|55.?57 kg|bust.?waist.?hips/i);
 });
 
