@@ -17,6 +17,10 @@ CONVY is a Discord conversational assistant running on a Cloudflare Worker with 
 3. Under **OAuth2 → URL Generator**, select `bot` and `applications.commands`. Grant View Channel and Read Message History in channels the bot should monitor, Send Messages in ordinary text/announcement channels, and Send Messages in Threads for thread replies, including forum/media posts. Then invite it to Convx.
 4. Set the bot ID, guild ID, target channel ID, admin role IDs, and your own Discord user ID in the Worker variables. Enable Developer Mode in Discord to copy IDs.
 
+## What CONVY can and cannot do
+
+When asked about her capabilities, CONVY should describe supported actions accurately rather than improvise tools. She can chat using recent text from channels the bot can access, search the web when enabled and authorized, answer Convx app setup questions using the official public repository and source links, and help draft Convx issue reports or comments. For GitHub reports, she checks likely open duplicates, shows a preview, and requires explicit confirmation before posting. Only configured admins can create new issues; members can propose comments on existing issues. GitHub actions require the configured token and permissions. CONVY cannot directly change Convx app settings, edit the app source code, execute arbitrary actions, or inspect inaccessible channels/DMs. If a feature or permission is unavailable, she must say so plainly.
+
 ## GitHub issue creation and community updates for Convx
 
 CONVY supports natural-language issue conversations in ordinary Discord messages; no bang command is needed. Mention CONVY or reply to her when reporting a Convx bug or asking to create an issue. She searches the `cosmictaserdev-creator/Convx` repository for similar open issues first. When a match exists, she recommends adding new evidence as a comment instead of opening another ticket. Users can say `add this info to #123` to attach the report they already supplied, or `comment on #123: new details` to prepare a comment. She previews each comment and asks for explicit confirmation before posting.
