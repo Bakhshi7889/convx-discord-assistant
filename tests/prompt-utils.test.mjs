@@ -80,9 +80,9 @@ test("capability answers describe supported features and preserve issue safeguar
   const prompt = buildConvySystemPrompt();
   assert.match(prompt, /CAPABILITIES:/);
   assert.match(prompt, /official public repository/);
-  assert.match(prompt, /Only configured admins may create new issues/);
+  assert.match(prompt, /Only configured admins create issues/);
   assert.match(prompt, /explicit confirmation/);
-  assert.match(prompt, /Never claim you can directly change app settings/);
+  assert.match(prompt, /cannot directly change app settings/);
 });
 
 test("official repository context uses actual line breaks and citation guidance", () => {
